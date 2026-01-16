@@ -1,0 +1,8838 @@
+// === КЛИМАТИЧЕСКАЯ КАМЕРА - ПРОМЫШЛЕННАЯ ВЕРСИЯ ===
+// === (v10.0 - Оптимизация RAM/Flash и ускорение UI) ===
+// =======================================================================
+
+
+#define ULONG_MAX 0xFFFFFFFFUL
+#define DEBUG_SERIAL 1  // Включаем вывод в Serial для отладки
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <avr/wdt.h>
+#include <util/crc16.h>
+#include <math.h>
+#include "RotondaBold20.h"
+#include <ArduinoJson.h>
+#include <Adafruit_SHT31.h>
+#include "FT6336U.h"
+
+static char currentProgramName[64] = "—";
+struct Settings;
+struct CuringProgram;
+struct GroupDefPGM {
+  const char* name_P;
+  uint8_t start;
+  uint8_t end;
+};
+struct GroupDefRAM {
+  const char* name;
+  uint8_t start;
+  uint8_t end;
+};
+#define MAX_STAGES 11
+struct Stage {
+  uint16_t durationHours;
+  float targetTemp;
+  float targetHum;
+  uint16_t fanInterval;
+  uint16_t fanDuration;
+};
+
+
+struct CuringProgram {
+  byte version;
+  uint8_t stageCount;
+  bool active;
+  uint8_t currentStage;
+  unsigned long startMillis;
+  uint8_t recipeId;
+  uint32_t startUnixTime;
+  Stage stages[MAX_STAGES];
+  uint16_t crc;
+};
+
+
+
+
+// ---------------- Макросы и константы ----------------
+#define C565(r, g, b) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
+#define SAFE_MILLIS_DIFF(start, end) ((end >= start) ? (end - start) : ((0xFFFFFFFFUL - start) + end + 1))
+#define DARK_BLUE C565(15, 30, 130)
+#define RECOVERY_SUCCESS_COUNT 5
+#define COOLER_PIN 2      // sikb: Пин управления охладителем (цифровой выход, реле/компрессор)
+#define HEATER_PIN 3      // sikb: Пин управления нагревателем (цифровой выход, реле/SSR)
+#define HUMIDIFIER_PIN 4  // sikb: Пин управления увлажнителем (цифровой выход, реле/помпа)
+#define FAN_PIN 5         // sikb: Пин управления вентилятором (цифровой выход, реле/транзистор)
+#define BUZZER_PIN 6      // sikb: Пин управления пищалкой/баззером (цифровой выход)
+#define TFT_CS 49         // sikb: Chip Select (CS) TFT дисплея (SPI), цифровой выход
+#define TFT_DC 45         // sikb: Data/Command (DC) TFT дисплея (SPI), цифровой выход
+#define TFT_RST 47        // sikb: Reset (RST) TFT дисплея, цифровой выход
+#define BACKLIGHT_PIN 46  // sikb: Пин управления яркостью подсветки TFT (PWM выход)
+
+
+// ---------------- EEPROM ----------------
+#define EEPROM_SETTINGS_ADDR 0           // sikb: EEPROM-адрес структуры Settings (основная копия)
+#define EEPROM_SETTINGS_BACKUP_ADDR 512  // sikb: EEPROM-адрес резервной копии Settings
+#define EEPROM_PROGRAM_ADDR 1024         // sikb: EEPROM-адрес структуры CuringProgram (текущая программа)
+#define EEPROM_VERSION 138               // sikb: Версия формата данных в EEPROM (для проверки и миграций)
+
+// ---------------- Централизованные позиции UI для экранов настроек ----------------
+#define SETTINGS_PANEL_X 132      // sikb: X-координата панели значения в UI
+#define SETTINGS_PANEL_Y1 140     // sikb: Y-координата верхней панели значения
+#define SETTINGS_PANEL_Y2 210     // sikb: Y-координата нижней панели значения
+#define SETTINGS_PANEL_W 216      // sikb: Ширина панели значения
+#define SETTINGS_PANEL_H 36       // sikb: Высота панели значения
+#define SETTINGS_LABEL_OFFSET 25  // sikb: Отступ подписи над панелью
+#define SETTINGS_BTN_MINUS_X 30   // sikb: X-координата кнопки “−”
+#define SETTINGS_BTN_PLUS_X 360   // sikb: X-координата кнопки “+”
+#define SETTINGS_BTN_W 90         // sikb: Ширина кнопки плюс/минус
+#define SETTINGS_BTN_H 40         // sikb: Высота кнопки плюс/минус
+#define SETTINGS_BTN_Y1 140       // sikb: Y-координата кнопок (верхний ряд)
+#define SETTINGS_BTN_Y2 210       // sikb: Y-координата кнопок (нижний ряд)
+#define SETTINGS_MODE_X 150       // sikb: X-координата кнопки выбора режима
+#define SETTINGS_MODE_Y 65        // sikb: Y-координата кнопки выбора режима
+#define SETTINGS_MODE_W 180       // sikb: Ширина кнопки выбора режима
+#define SETTINGS_MODE_H 40        // sikb: Высота кнопки выбора режима
+#define SETTINGS_BACK_X 180       // sikb: X-координата кнопки “Назад”
+#define SETTINGS_BACK_Y 270       // sikb: Y-координата кнопки “Назад”
+#define SETTINGS_BACK_W 120       // sikb: Ширина кнопки “Назад”
+#define SETTINGS_BACK_H 40        // sikb: Высота кнопки “Назад”
+#define SETTINGS_HEADER_Y 40      // sikb: Y-координата заголовка экрана настроек
+
+// ---------------- Унифицированные шаги/диапазоны ----------------
+#define STEP_TEMP 0.1f          // sikb: Шаг изменения целевой температуры (°C)
+#define MIN_TEMP 0.0f           // sikb: Минимальная температура (°C)
+#define MAX_TEMP 30.0f          // sikb: Максимальная температура (°C)
+#define STEP_HYST 0.1f          // sikb: Шаг изменения гистерезиса (°C/%)
+#define MIN_HYST 0.1f           // sikb: Минимальный гистерезис (°C/%)
+#define MAX_HYST_TEMP 5.0f      // sikb: Максимальный гистерезис температуры (°C)
+#define MAX_HYST_HUM 10.0f      // sikb: Максимальный гистерезис влажности (%)
+#define STEP_HUM 1.0f           // sikb: Шаг изменения целевой влажности (%)
+#define MIN_HUM 10.0f           // sikb: Минимальная влажность (%)
+#define MAX_HUM 100.0f          // sikb: Максимальная влажность (%)
+#define STEP_TEMP_BIAS 0.1f     // sikb: Шаг изменения смещения температуры (калибровка, °C)
+#define MIN_TEMP_BIAS -10.0f    // sikb: Минимальное смещение температуры (°C)
+#define MAX_TEMP_BIAS 10.0f     // sikb: Максимальное смещение температуры (°C)
+#define STEP_HUM_BIAS 0.1f      // sikb: Шаг изменения смещения влажности (калибровка, %)
+#define MIN_HUM_BIAS -20.0f     // sikb: Минимальное смещение влажности (%)
+#define MAX_HUM_BIAS 20.0f      // sikb: Максимальное смещение влажности (%)
+#define STEP_FAN 1.0f           // sikb: Шаг изменения таймера вентилятора (ч/мин)
+#define MIN_FAN 0.0f            // sikb: Минимальное значение таймера вентилятора
+#define MAX_FAN_INTERVAL 24.0f  // sikb: Максимальный интервал работы вентилятора (ч)
+#define MAX_FAN_DURATION 60.0f  // sikb: Максимальная длительность работы вентилятора (мин)
+#define HUB_BTN_START_Y 70      // sikb: Y-координата первой кнопки хаба настроек
+#define HUB_BTN_SPACING 15      // sikb: Вертикальный зазор между кнопками хаба
+#define SYSTEM_BTN_START_Y 70   // sikb: Y-координата первой системной кнопки
+#define SYSTEM_BTN_SPACING 10   // sikb: Вертикальный зазор между системными кнопками
+#define SYSTEM_BTN_WIDTH 300    // sikb: Ширина системных кнопок
+#define SYSTEM_BTN_HEIGHT 50    // sikb: Высота системных кнопок
+
+// ============================================================================
+// Параметры прогресс-баров
+// ============================================================================
+#define PROGRESS_BAR_Y 175        // sikb: Y-координата полос прогресса
+#define PROGRESS_BAR_HEIGHT 20    // sikb: Высота полосы прогресса
+#define PROGRESS_BAR_RADIUS 7     // sikb: Радиус скругления углов полосы прогресса
+#define PROGRESS_BAR_GAP 20       // sikb: Зазор между левой и правой полосой прогресса
+#define LEFT_PROGRESS_X 13        // sikb: X-координата левой полосы прогресса
+#define LEFT_PROGRESS_WIDTH 190   // sikb: Ширина левой полосы прогресса
+#define RIGHT_PROGRESS_WIDTH 190  // sikb: Ширина правой полосы прогресса
+#define RIGHT_PROGRESS_X 247      // sikb: X-координата правой полосы прогресса
+#define PROGRESS_BAR_PADDING 4    // sikb: Внутренний отступ (padding) в полосе прогресса
+#define PROGRESS_TEXT_GAP 17      // sikb: Отступ между текстом и числом процентов
+#define PROGRESS_LABEL_BAR_GAP 4  // sikb: Отступ между подписью и полосой прогресса
+
+// ============================================================================
+// Параметры карточек главного экрана
+// ============================================================================
+#define SCREEN_WIDTH 480                                                                               // sikb: Ширина экрана (TFT)
+#define SCREEN_HEIGHT 320                                                                              // sikb: Высота экрана (TFT)
+#define STATUS_BAR_X 6                                                                                 // sikb: X-координата статус-бара (верхняя полоска)
+#define STATUS_BAR_Y 4                                                                                 // sikb: Y-координата статус-бара
+#define STATUS_BAR_WIDTH 468                                                                           // sikb: Ширина статус-бара
+#define STATUS_BAR_HEIGHT 26                                                                           // sikb: Высота статус-бара
+#define STATUS_BAR_RADIUS 12                                                                           // sikb: Радиус скругления углов статус-бара
+#define CARD_Y 38                                                                                      // sikb: Y-координата карточек Температуры/Влажности
+#define CARD_WIDTH 210                                                                                 // sikb: Ширина карточки
+#define CARD_HEIGHT 113                                                                                // sikb: Высота карточки
+#define CARD_RADIUS 25                                                                                 // sikb: Радиус скругления углов карточки
+#define CARD_GAP 32                                                                                    // sikb: Зазор между карточками
+#define TEMP_CARD_X 18                                                                                 // sikb: X-координата карточки Температуры
+#define HUM_CARD_X (SCREEN_WIDTH - TEMP_CARD_X - CARD_WIDTH)                                           // sikb: X-координата карточки Влажности (вычисляется)
+#define CARD_INNER_MARGIN_H 16                                                                         // sikb: Горизонтальный внутренний отступ в карточке
+#define CARD_INNER_MARGIN_V_TOP 30                                                                     // sikb: Верхний вертикальный внутренний отступ в карточке
+#define CARD_INNER_MARGIN_V_BOTTOM 25                                                                  // sikb: Нижний внутренний отступ в карточке
+#define CARD_ICON_OFFSET_X 15                                                                          // sikb: Смещение иконки по X в карточке
+#define CARD_ICON_OFFSET_Y 15                                                                          // sikb: Смещение иконки по Y в карточке
+#define SEGMENTS_Y 210                                                                                 // sikb: Y-координата верхней границы сегментов (нижние плитки)
+#define SEGMENTS_HEIGHT 104                                                                            // sikb: Высота сегментов
+#define SEGMENTS_START_X 8                                                                             // sikb: X-координата начала первой плитки
+#define SEGMENTS_GAP 6                                                                                 // sikb: Зазор между плитками
+#define SEGMENTS_COUNT 5                                                                               // sikb: Количество плиток (сегментов) внизу
+#define SEGMENTS_RADIUS 21                                                                             // sikb: Радиус скругления углов плитки
+#define SEGMENTS_TOTAL_WIDTH 465                                                                       // sikb: Общая ширина области сегментов
+#define SEGMENT_WIDTH ((SEGMENTS_TOTAL_WIDTH - SEGMENTS_GAP * (SEGMENTS_COUNT - 1)) / SEGMENTS_COUNT)  // sikb: Вычисляемая ширина одной плитки
+// ---------------- Константы времени ----------------
+const uint64_t MILLIS_PER_HOUR = 3600000ULL;                  // 1 час = 3 600 000 миллисекунд (мс). Используется для пересчёта часов в миллисекунды.
+const uint64_t MILLIS_PER_DAY = 86400000ULL;                  // 1 день = 86 400 000 миллисекунд. Для пересчёта дней в миллисекунды.
+const unsigned long STATUS_LOG_INTERVAL = 10800000UL;         // Интервал логирования статуса — 10 800 000 мс = 3 часа. Пишет лог каждые 3 часа.
+const unsigned long MILLIS_PER_MINUTE = 60000UL;              // 1 минута = 60 000 миллисекунд. Для таймеров, пересчёта минут.
+const unsigned long SENSOR_RECOVERY_INTERVAL = 300000UL;      // Интервал попытки восстановления датчиков — 300 000 мс = 5 минут.
+const unsigned long EEPROM_CRC_CHECK_INTERVAL = 86400000UL;   // Интервал проверки CRC EEPROM — 86 400 000 мс = 24 часа (раз в сутки).
+const unsigned long BRIGHTNESS_DIM_TIMEOUT = 60000UL;         // Время до выключение  подсветки — 60 000 мс = 1 минута без касаний.
+const unsigned long ALARM_BRIGHTNESS_DIM_TIMEOUT = 300000UL;  // 3 минуты в тревоге
+const uint8_t FULL_BRIGHTNESS = 255;                          // Максимальная яркость подсветки TFT (PWM, 255 — максимум).
+const uint8_t DIM_BRIGHTNESS = 10;                            // Притушенная яркость (127 — средняя).
+
+
+// ---- UI timing tuning ----
+const unsigned long TOUCH_DEBOUNCE_MS = 10;      // антидребезг тача и кнопок (было 100-200)
+const unsigned long PRESS_VISUAL_MS = 35;        // время "нажатого" состояния (было 160)
+const unsigned long BUTTON_UPDATE_RATE_MS = 10;  // период опроса визуала кнопок (было 100)
+const unsigned long SCREEN_DELAY_MS = 0;         // паузы при переходах (было 150-200)
+
+// ---------------- Безопасность и логика ----------------
+const float MAX_SENSOR_TEMP_JUMP = 5.0;  // Максимально допустимый скачок температуры (°C) за один замер. Если скачок больше — считается ошибкой датчика.
+const float MAX_SENSOR_HUM_JUMP = 20.0;  // Максимально допустимый скачок влажности (%) за один замер. Слишком резкое изменение — ошибка датчика.
+const float EMERGENCY_TEMP_MAX = 32.0;   // Абсолютный максимум температуры
+const float EMERGENCY_TEMP_MIN = 0.0;    // Абсолютный минимум температуры
+// Минимальное время работы исполнительных устройств (не даём часто включать-выключать реле):
+const unsigned long MIN_COOLER_ON_TIME = 60000UL;     // Минимальное время работы охладителя — 60 000 мс = 1 минута.
+const unsigned long MIN_HEATER_ON_TIME = 1000UL;      // Минимальное время работы нагревателя — 1 000 мс = 1 секунд.
+const unsigned long MIN_HUMIDIFIER_ON_TIME = 1000UL;  // Минимальное время работы увлажнителя — 1 000 мс = 1 секунд.
+const unsigned long MAX_COOLER_RUNTIME = 3600000UL;   // Максимальное непрерывное время работы охладителя — 36 00 000 мс = 60 минут (защита от зависания).
+// Минимальное время простоя между включениями (охрана реле и компрессора):
+const unsigned long COOLER_MIN_OFF_TIME = 300000UL;         // Минимальное время простоя охладителя после выключения — 300 000 мс = 5 минут.
+const unsigned long HEATER_MIN_OFF_TIME = 3000UL;           // Минимальное время простоя нагревателя после выключения — 3 000 мс = 3 секунды.
+const unsigned long HUMIDIFIER_MIN_OFF_TIME = 3000UL;       // Минимальное время простоя увлажнителя после выключения — 3 000 мс = 3 секунды.
+const unsigned long HEATER_COOLER_LOCKOUT_TIME = 60000UL;   // Взаимная блокировка: после выключения одного устройства другое нельзя включать 60 000 мс = 1 минута (переключение нагрев/охладитель).
+const unsigned long SENSOR_STUCK_TIMEOUT = 900000UL;        // Тайм-аут "зависания" датчиков — если температура/влажность не меняются 900 000 мс = 15 минут при активном устройстве, считается зависшим.
+const float HUMIDITY_RISE_THRESHOLD = 0.5f;                 // Минимальный прирост влажности (%) после старта увлажнителя, чтобы не считать ошибкой/отсутствием воды.
+const unsigned long HUMIDITY_DROP_CHECK_DELAY = 180000UL;   // Время ожидания после запуска увлажнителя для проверки прироста влажности — 180 000 мс = 3 минуты.
+const unsigned long WATCHDOG_CHECKPOINT_TIMEOUT = 30000UL;  // Максимальное время между "пульсами" основного цикла — 30 000 мс = 30 секунд. Если превышено — аппаратный сброс (watchdog).
+const unsigned long COOLER_STUCK_CHECK_DELAY = 1800000UL;   // Время ожидания снижения температуры после включения охладителя — 1800 000 мс = 25 минут, иначе "охладитель завис".
+const float TEMPERATURE_DROP_THRESHOLD = 1.0f;              // Минимальное снижение температуры (°C), ожидаемое после включения охладителя. Меньше — сигнализация о неисправности.
+const unsigned long BEEPER_INTERVAL = 600;                  // Интервал переключения состояния пищалки/баззера при тревоге — 600 мс.
+// === В начало файла (глобальные переменные) ===
+unsigned long lastEspStatusTime = 0;           // Время последнего статуса Wi-Fi от ESP (для отслеживания связи).
+const unsigned long WIFI_TIMEOUT_MS = 180000;  // Таймаут ожидания связи с ESP — 180 000 мс = 3 минуты. После него Wi-Fi считается отключённым.
+unsigned long lastHeartbeatLog = 0;
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000;  // интервал heartbeat в Serial
+// НОВОЕ: Константа для проверки валидности UNIX времени
+const uint32_t UNIX_TIME_MIN_VALID = 1609459200UL;  // 2021-01-01 00:00:00 UTC
+
+const unsigned long DRYING_MAX_WAIT_COOLER_MS = 7UL * 60UL * 1000UL;  // максимум ждём снятия lockout компрессора
+const unsigned long DRYING_COOLER_TRY_PERIOD_MS = 15000UL;            // попытка включить компрессор раз в 15 сек
+
+// ====NSP ВРЕМЯ===
+unsigned long lastTimeReqMs = 0;
+const unsigned long TIME_REQ_INTERVAL_MS = 5000UL;  // период запросов времени, пока не получили
+bool ntpSyncDone = false;                           // отметка: мы уже получали NTP-время от ESP
+unsigned long lastNtpSyncMs = 0;                    // когда получили время от ESP
+bool prevWifiConnectedFlag = false;                 // для детекта фронта Wi-Fi
+uint8_t lastDailySyncDay = 0;                       // для ежедневной ресинхронизации
+
+// ---------------- Строки UI в PROGMEM ----------------
+const char S_TEMPERATURE[] PROGMEM = "ТЕМПЕРАТУРА";
+const char S_HUMIDITY[] PROGMEM = "ВЛАЖНОСТЬ";
+const char S_HEAT[] PROGMEM = "НАГРЕВ";
+const char S_COOL[] PROGMEM = "ХОЛОД";
+const char S_HUMIDIFY[] PROGMEM = " ВЛАЖ";
+const char S_FAN[] PROGMEM = "  ВЕНТ";
+const char S_FAN_FULL[] PROGMEM = "ВЕНТИЛЯТОР";
+const char S_SETTINGS[] PROGMEM = " НАСТР";
+const char S_SETTINGS_FULL[] PROGMEM = "НАСТРОЙКИ";
+const char S_HEATER[] PROGMEM = "НАГРЕВАТЕЛЬ";
+const char S_COOLER[] PROGMEM = "ОХЛАДИТЕЛЬ";
+const char S_HUMIDIFIER[] PROGMEM = "УВЛАЖНИТЕЛЬ";
+const char S_CALIBRATION[] PROGMEM = "КАЛИБРОВКА ДАТЧИКОВ";
+const char S_HW_TEST[] PROGMEM = "ТЕСТ АППАРАТУРЫ";
+const char S_RECIPES[] PROGMEM = "РЕЦЕПТЫ";
+const char S_SYSTEM[] PROGMEM = "СИСТЕМА";
+const char S_SET_CLOCK[] PROGMEM = "УСТАНОВКА ЧАСОВ";
+const char S_HALTED[] PROGMEM = "SYSTEM STOPPED";
+const char S_RTC_ERR[] PROGMEM = "ОБРЫВ МОДУЛЯ ЧАСОВ";
+const char S_RTC_BATT_ERR[] PROGMEM = "БАТАРЕЙКА ЧАСОВ НЕИСПРАВНА";
+const char S_TARGET[] PROGMEM = "ЦЕЛЬ";
+const char S_HYST[] PROGMEM = "ГИСТЕРЕЗИС";
+const char S_INTERVAL[] PROGMEM = "ИНТЕРВАЛ";
+const char S_DURATION[] PROGMEM = "ДЛИТ";
+const char S_TEMP_OFFSET[] PROGMEM = "СМЕЩЕНИЕ ТЕМПЕРАТУРЫ";
+const char S_HUM_OFFSET[] PROGMEM = "СМЕЩЕНИЕ ВЛАЖНОСТИ";
+const char S_UNIT_C[] PROGMEM = "°C";
+const char S_UNIT_PCT[] PROGMEM = "%";
+const char S_UNIT_H[] PROGMEM = "h";
+const char S_UNIT_MIN[] PROGMEM = "min";
+const char S_YEAR[] PROGMEM = "Г:";
+const char S_MONTH[] PROGMEM = "М:";
+const char S_DAY[] PROGMEM = "Д:";
+const char S_HOUR[] PROGMEM = "Ч:";
+const char S_MINUTE[] PROGMEM = "М:";
+const char S_EEPROM_WIPE[] PROGMEM = "СТИРАНИЕ ПАМЯТИ";
+const char S_EEPROM_CLEARED[] PROGMEM = "ПАМЯТЬ ОЧИЩЕНА";
+const char S_EEPROM_WIPE_BTN[] PROGMEM = "СТЕРЕТЬ";
+const char S_TIMEZONE[] PROGMEM = "ЧАСОВОЙ ПОЯС";
+const char S_BEEPER_ON[] PROGMEM = " БИПЕР ВКЛЮЧЕН";
+const char S_BEEPER_OFF[] PROGMEM = " БЕЗ ЗВУКА";
+
+static const char S_SENSOR_ERR[] PROGMEM = "ERROR SENSORS !";
+static const char S_OVERHEAT[] PROGMEM = "OVERHEAT !";
+static const char S_UNDERCOOL[] PROGMEM = "UNDERCOOL!";
+
+
+static const char S_KOPPA_HEADER[] PROGMEM = "СЫРОВЯЛЕННОЕ МЯСО - КОППА";
+static const char S_HAMON_HEADER[] PROGMEM = "СЫРОВЯЛЕННОЕ МЯСО - ХАМОН";
+static const char S_SALCHICHON_HEADER[] PROGMEM = "СЫРОВЯЛЕНАЯ КОЛБАСА - САЛЬЧИЧОН 55 мм";
+static const char S_FUET_HEADER[] PROGMEM = "СЫРОВЯЛЕНАЯ КОЛБАСА - ФУЭТ 28 мм";
+
+// ЕДИНЫЕ метки
+static const char S_STAGE_LABEL[] PROGMEM = "Этап:";
+static const char S_TOTAL_PROGRESS[] PROGMEM = "Общий прогресс:";
+static const char S_PROGRAM_INACTIVE[] PROGMEM = "ПРОГРАММА НЕАКТИВНА";
+
+// Заголовки колонок
+static const char S_COL_STAGE[] PROGMEM = "ЭТАП";
+static const char S_COL_DURATION[] PROGMEM = "ДЛИТ";
+static const char S_COL_TEMP[] PROGMEM = "ТЕМП";
+static const char S_COL_RH[] PROGMEM = "ВЛАЖ";
+
+// Группы (единый регистр)
+static const char S_GRP_FERMENT[] PROGMEM = "ФЕРМЕНТАЦИЯ";
+static const char S_GRP_STAB[] PROGMEM = "СТАБИЛИЗАЦИЯ";
+static const char S_GRP_MATURE[] PROGMEM = "СОЗРЕВАНИЕ";
+static const char S_GRP_AGING[] PROGMEM = "ВЫДЕРЖКА";
+
+// Новые/оставшиеся строки UI
+const char S_BACK[] PROGMEM = "НАЗАД";
+const char S_SELECT[] PROGMEM = "ВЫБОР";
+const char S_ACTIVE[] PROGMEM = "АКТИВНА";
+const char S_STOPPED[] PROGMEM = "НЕАКТИВНА";
+const char S_KOPPA[] PROGMEM = "КОППА";
+const char S_HAMON[] PROGMEM = "ХАМОН";
+const char S_KOLBASA[] PROGMEM = "КОЛБАСА";
+const char S_FAN_STATUS_LABEL[] PROGMEM = "СОСТОЯНИЕ ВЕНТИЛЯТОРА:";
+const char S_TAP_TO_RETRY[] PROGMEM = "TAP TO RESET";
+// Управление PID
+
+const char S_PID_PARAMS[] PROGMEM = "PID ПАРАМЕТРЫ";
+const char S_PID_ON[] PROGMEM = " ВКЛ ПИД";
+const char S_PID_OFF[] PROGMEM = " ВЫКЛ ПИД";
+const char S_PID_AUTOTUNE[] PROGMEM = " АВТОТЮНИНГ PID";
+const char S_PID_DONE[] PROGMEM = "АВТОТЮНИНГ ЗАВЕРШЕН";
+
+
+
+
+// --- Автотюнинг PID (Relay autotune, Åström–Hägglund) ---
+static bool atRelayHigh = false;  // нагрев ON/OFF в autotune
+static float atSetpoint = 15.0f;  // фиксированная уставка autotune (°C)
+static float atNoiseBand = 0.8f;  // полоса гистерезиса вокруг уставки (°C)
+static float atHigh = 0.0f, atLow = 0.0f;
+
+static bool atHaveHigh = false, atHaveLow = false;
+static float atPrevT = 0.0f;
+static int atTrend = 0;  // -1 падает, +1 растет, 0 неизвестно
+static unsigned long atLastPeakMs = 0;
+static unsigned long atPrevPeakMs = 0;
+static uint8_t atPeaks = 0;
+static float atAmpSum = 0.0f;
+static uint8_t atCycles = 0;
+static unsigned long atNextUiUpdateMs = 0;
+// --- DRYING safe additions (minimal) ---
+static unsigned long dryingCoolerRequestMs = 0;  // когда в сушке впервые запросили компрессор
+static unsigned long dryingLastCoolerTryMs = 0;  // чтобы не спамить setCooler(true)
+
+
+// ==== PROGRAM PAUSE (RTC/NTP LOSS) ====
+static bool programPausedByTimeLoss = false;
+static uint32_t programPauseUnix = 0;     // unix time at moment of pause (RTC time)
+static unsigned long programPauseMs = 0;  // millis at moment of pause (fallback stamp)
+
+
+
+// ---------------- Служебные типы ----------------
+struct Button {
+  int x, y, w, h;
+};
+enum Mode3 { MODE_AUTO = 0,
+             MODE_ON = 1,
+             MODE_OFF = 2,
+             MODE_TIMED = 3 };
+
+
+struct SegmentColors {
+  uint16_t top, bottom;
+  uint16_t iconActive, iconInactive;
+};
+
+struct ThemeColors {
+  uint16_t bgTop, bgBottom;
+  uint16_t statusTop, statusBottom, statusBorder;
+  uint16_t tempTop, tempBottom;
+  uint16_t humTop, humBottom;
+  uint16_t txtMain, txtDim, txtBlack, txtStatus;
+  uint16_t panelBorder, okColor, alertColor, shadowColor;
+  SegmentColors seg[4];
+  uint16_t darkGreenMode;
+};
+
+enum ThemeId { THEME_B = 0,
+               THEME_COUNT = 1 };
+
+const ThemeColors themes[THEME_COUNT] PROGMEM = {
+  {                          // 16 основных цветов
+    C565(60, 70, 80),        // bgTop
+    C565(80, 95, 110),       // bgBottom
+    C565(110, 120, 130),     // statusTop
+    C565(110, 120, 130),     // statusBottom
+    C565(0x27, 0x32, 0x3D),  // statusBorder
+    C565(0xFF, 0xB7, 0x80),  // tempTop
+    C565(0xFF, 0x3D, 0x00),  // tempBottom
+    C565(0x00, 0xC6, 0xFF),  // humTop
+    C565(0x00, 0x72, 0xFF),  // humBottom
+    0x0000,                  // txtMain
+    0xAD55,                  // txtDim
+    0x0000,                  // txtBlack
+    0xFFFF,                  // txtStatus
+    0x39E7,                  // panelBorder
+    C565(0x00, 0xF0, 0x80),  // okColor
+    C565(255, 0, 0),         // alertColor
+    0x0841,                  // shadowColor
+
+    // seg[4]  <-- ВАЖНО: это именно массив из 4 элементов SegmentColors
+    {
+      { C565(230, 120, 40), C565(200, 80, 30), C565(255, 180, 80), 0x5ACB },              // Heater
+      { C565(90, 200, 230), C565(30, 140, 230), C565(50, 50, 50), C565(200, 200, 200) },  // Cooler
+      { C565(0, 110, 170), C565(0, 70, 130), 0xFFFF, 0x5ACB },                            // Humid
+      { C565(120, 200, 60), C565(80, 160, 40), 0xFFFF, C565(173, 255, 47) }               // Fan
+    },
+
+    // darkGreenMode
+    C565(0, 70, 0) }
+};
+
+
+
+const ThemeId currentTheme = THEME_B;
+ThemeColors TCache;  // Кэш темы в RAM (загружается один раз)
+static inline void loadThemeCache() {
+  memcpy_P(&TCache, &themes[currentTheme], sizeof(ThemeColors));
+}
+
+static inline const char* modeToString(Mode3 m) {
+  switch (m) {
+    case MODE_AUTO: return "AUTO";
+    case MODE_ON: return "ON";
+    case MODE_OFF: return "OFF";
+    case MODE_TIMED: return "TIMED";
+    default: return "AUTO";
+  }
+}
+
+
+const uint16_t LIGHT_GREEN_PANEL = C565(144, 238, 144);
+uint16_t darkGreenMode;
+
+// ---------------- Состояние приложения ----------------
+enum ScreenState {
+  SCREEN_MAIN,
+  SCREEN_SETTINGS_HUB,
+  SCREEN_HEATER,
+  SCREEN_COOLER,
+  SCREEN_HUMID,
+  SCREEN_FAN,
+  SCREEN_RECIPES,
+  SCREEN_CALIBRATION,
+  SCREEN_HW_TEST,
+  SCREEN_SYSTEM,
+  SCREEN_SET_CLOCK,
+  SCREEN_KOPPA,
+  SCREEN_EEPROM_WIPE,
+  SCREEN_HAMON,
+  SCREEN_SALCHICHON,
+  SCREEN_FUET,
+  SCREEN_PID,
+};
+enum SelectedField {
+  FIELD_NONE,
+  FIELD_YEAR,
+  FIELD_MONTH,
+  FIELD_DAY,
+  FIELD_HOUR,
+  FIELD_MINUTE,
+  FIELD_SECOND,
+  FIELD_TZ
+};
+
+// 3) Добавить поле часового пояса в Settings (в конец структуры)
+struct Settings {
+  byte version;
+  float targetTemp;
+  float targetHum;
+  float tempHeatHysteresis;
+  float tempCoolHysteresis;
+  float humHysteresis;
+  float tempBias;
+  float humBias;
+  Mode3 heaterMode;
+  Mode3 coolerMode;
+  Mode3 humidMode;
+  Mode3 fanMode;
+  uint16_t manualFanIntervalHours;
+  uint16_t manualFanDurationMinutes;
+  int8_t tzOffsetHours;
+  bool beeperEnabled;
+  bool pidEnabled;  // включён ли PID для нагрева
+  float pidKp;
+  float pidKi;
+  float pidKd;
+  uint16_t pidWindowMs;  // окно PWM для SSR, мс
+  uint16_t crc;
+};
+
+
+// ИД рецептов в EEPROM
+enum RecipeId : uint8_t {
+  RECIPE_KOPPA = 0,
+  RECIPE_HAMON = 1,
+  RECIPE_SALCHICHON = 2,
+  RECIPE_FUET = 3,
+  RECIPE_UNKNOWN = 255
+};
+
+static inline const char* recipeNameById(uint8_t id) {
+  switch (id) {
+    case RECIPE_KOPPA: return "КОППА";
+    case RECIPE_HAMON: return "ХАМОН";
+    case RECIPE_SALCHICHON: return "КОЛБАСА САЛЬЧИЧОН 55 ММ";
+    case RECIPE_FUET: return "КОЛБАСА ФУЭТ 28 ММ";
+    default: return "—";
+  }
+}
+
+static inline void setCurrentProgramName(const char* name) {
+  if (!name || !*name) {
+    strncpy(currentProgramName, "—", sizeof(currentProgramName) - 1);
+  } else {
+    strncpy(currentProgramName, name, sizeof(currentProgramName) - 1);
+  }
+  currentProgramName[sizeof(currentProgramName) - 1] = '\0';
+}
+
+
+static inline void setNameFromRecipeId(uint8_t id) {
+  setCurrentProgramName(recipeNameById(id));
+}
+
+// Эвристика для миграции старых записей без recipeId
+static uint8_t guessRecipeId(const CuringProgram& p) {
+  if (p.stageCount == 11) {
+    // КОППА: первые два этапа 10ч и 14ч
+    if (p.stages[0].durationHours == 10 && p.stages[1].durationHours == 14) return RECIPE_KOPPA;
+    // САЛЬЧИЧОН: S1==48ч, S2==72ч, S3==96ч, S4==120ч
+    if (p.stages[3].durationHours == 48 && p.stages[4].durationHours == 72 && p.stages[5].durationHours == 96 && p.stages[6].durationHours == 120) return RECIPE_SALCHICHON;
+  } else if (p.stageCount == 10) {
+    return RECIPE_FUET;
+  } else if (p.stageCount == 9) {
+    return RECIPE_HAMON;
+  }
+  return RECIPE_UNKNOWN;
+}
+
+
+
+void buildKoppaProgram(CuringProgram& p) {
+  p.version = EEPROM_VERSION;
+  p.stageCount = 11;
+  p.active = false;
+  p.currentStage = 0;
+  p.startMillis = 0;
+  p.startUnixTime = 0;
+  p.recipeId = RECIPE_KOPPA;
+
+  // День 9 (разбит на 2 подпериода)
+  p.stages[0] = { 10, 24.0f, 92.0f, 4, 1 };
+  p.stages[1] = { 14, 22.0f, 92.0f, 4, 1 };
+
+  // Дни 10–16
+  p.stages[2] = { 24, 19.0f, 80.0f, 4, 1 };
+  p.stages[3] = { 24, 18.0f, 78.0f, 4, 1 };
+  p.stages[4] = { 24, 17.0f, 77.0f, 4, 1 };
+  p.stages[5] = { 24, 16.0f, 76.0f, 4, 1 };
+  p.stages[6] = { 24, 15.0f, 75.0f, 4, 1 };
+  p.stages[7] = { 24, 14.0f, 74.0f, 4, 1 };
+  p.stages[8] = { 24, 13.0f, 73.0f, 4, 1 };
+
+  // Созревание 67 дней
+  p.stages[9] = { (uint16_t)(67 * 24), 13.5f, 81.0f, 4, 1 };
+
+  // Финальная неделя 7 дней
+  p.stages[10] = { (uint16_t)(7 * 24), 13.5f, 72.5f, 4, 1 };
+}
+
+
+// 7) Построители программ — ДОБАВЬ (ХАМОН строго по твоим данным)
+void buildHamonProgram(CuringProgram& p) {
+  p.version = EEPROM_VERSION;
+  p.stageCount = 9;
+  p.active = false;
+  p.currentStage = 0;
+  p.startMillis = 0;
+  p.startUnixTime = 0;
+  p.recipeId = RECIPE_HAMON;
+
+  // Ферментация
+  p.stages[0] = { 5 * 24, 15.5f, 90.0f, 12, 1 };
+  p.stages[1] = { 10 * 24, 16.0f, 86.0f, 8, 1 };
+  p.stages[2] = { 10 * 24, 16.5f, 83.0f, 6, 1 };
+
+  // Стабилизация
+  p.stages[3] = { 20 * 24, 14.0f, 78.0f, 6, 1 };
+  p.stages[4] = { 20 * 24, 13.0f, 76.0f, 6, 1 };
+
+  // Созревание
+  p.stages[5] = { 60 * 24, 13.5f, 73.0f, 4, 1 };
+  p.stages[6] = { 60 * 24, 14.0f, 71.0f, 4, 1 };
+
+  // Выдержка
+  p.stages[7] = { 90 * 24, 13.0f, 69.0f, 6, 1 };
+  p.stages[8] = { 60 * 24, 12.5f, 67.0f, 8, 1 };
+}
+
+void buildSalchichonProgram(CuringProgram& p) {
+  p.version = EEPROM_VERSION;
+  p.stageCount = 11;
+  p.active = false;
+  p.currentStage = 0;
+  p.startMillis = 0;
+  p.startUnixTime = 0;
+  p.recipeId = RECIPE_SALCHICHON;
+
+  // Ферментация детально
+  p.stages[0] = { 24, 23.0f, 94.0f, 12, 1 };  // F1
+  p.stages[1] = { 24, 22.0f, 92.0f, 12, 1 };  // F2
+  p.stages[2] = { 24, 20.0f, 90.0f, 10, 1 };  // F3
+
+  // Стабилизация
+  p.stages[3] = { 48, 18.0f, 88.0f, 8, 1 };   // S1
+  p.stages[4] = { 72, 17.0f, 86.0f, 8, 1 };   // S2
+  p.stages[5] = { 96, 16.0f, 84.0f, 6, 1 };   // S3
+  p.stages[6] = { 120, 15.0f, 82.0f, 6, 1 };  // S4
+
+  // Созревание
+  p.stages[7] = { 240, 13.5f, 79.0f, 4, 1 };  // M1
+  p.stages[8] = { 240, 14.0f, 77.0f, 4, 1 };  // M2 (середина диапазона 13.0–14.5)
+
+  // Выдержка
+  p.stages[9] = { 168, 12.5f, 75.0f, 6, 1 };  // A1
+  p.stages[10] = { 72, 12.0f, 74.0f, 8, 1 };  // A2
+}
+
+void buildFuetProgram(CuringProgram& p) {
+  p.version = EEPROM_VERSION;
+  p.stageCount = 10;
+  p.active = false;
+  p.currentStage = 0;
+  p.startMillis = 0;
+  p.startUnixTime = 0;
+  p.recipeId = RECIPE_FUET;
+
+  // Ферментация
+  p.stages[0] = { 24, 23.0f, 94.0f, 12, 1 };  // F1
+  p.stages[1] = { 12, 22.0f, 92.0f, 12, 1 };  // F2
+
+  // Стабилизация
+  p.stages[2] = { 48, 18.0f, 88.0f, 8, 1 };  // S1
+  p.stages[3] = { 48, 17.0f, 86.0f, 8, 1 };  // S2
+  p.stages[4] = { 72, 16.0f, 84.0f, 6, 1 };  // S3
+
+  // Созревание
+  p.stages[5] = { 168, 13.5f, 78.0f, 4, 1 };  // M1
+  p.stages[6] = { 120, 13.0f, 76.0f, 4, 1 };  // M2
+
+  // Выдержка
+  p.stages[7] = { 72, 12.5f, 74.0f, 6, 1 };  // A1
+  p.stages[8] = { 48, 12.5f, 72.0f, 8, 1 };  // A2
+  p.stages[9] = { 60, 12.0f, 72.0f, 8, 1 };  // A3
+}
+
+/// 4) Значение по умолчанию — UTC+3
+static inline void initDefaultSettings(Settings& s) {
+  s.version = EEPROM_VERSION;
+  s.targetTemp = 15.0f;
+  s.targetHum = 75.0f;
+  s.tempHeatHysteresis = 0.5f;
+  s.tempCoolHysteresis = 0.5f;
+  s.humHysteresis = 0.5f;
+  s.tempBias = 0.0f;
+  s.humBias = 0.0f;
+  s.heaterMode = MODE_AUTO;
+  s.coolerMode = MODE_AUTO;
+  s.humidMode = MODE_AUTO;
+  s.fanMode = MODE_AUTO;
+  s.manualFanIntervalHours = 4;
+  s.manualFanDurationMinutes = 15;
+  s.tzOffsetHours = 3;
+  s.beeperEnabled = true;
+  s.pidEnabled = false;
+  s.pidKp = 3.0f;
+  s.pidKi = 0.3f;
+  s.pidKd = 5.0f;
+  s.pidWindowMs = 10000;  // 10 секунд окно для SSR
+}
+static inline void initDefaultProgram(CuringProgram& p) {
+  buildKoppaProgram(p);
+}
+
+// Для JSON/логики (RAM-строки)
+static const GroupDefRAM G_KOPPA_RAM[4] = {
+  { "ФЕРМЕНТАЦИЯ", 0, 1 },
+  { "СТАБИЛИЗАЦИЯ", 2, 8 },
+  { "СОЗРЕВАНИЕ", 9, 9 },
+  { "ВЫДЕРЖКА", 10, 10 }
+};
+static const GroupDefRAM G_HAMON_RAM[4] = {
+  { "ФЕРМЕНТАЦИЯ", 0, 2 },
+  { "СТАБИЛИЗАЦИЯ", 3, 4 },
+  { "СОЗРЕВАНИЕ", 5, 6 },
+  { "ВЫДЕРЖКА", 7, 8 }
+};
+static const GroupDefRAM G_SAL_RAM[4] = {
+  { "ФЕРМЕНТАЦИЯ", 0, 2 },
+  { "СТАБИЛИЗАЦИЯ", 3, 6 },
+  { "СОЗРЕВАНИЕ", 7, 8 },
+  { "ВЫДЕРЖКА", 9, 10 }
+};
+static const GroupDefRAM G_FUET_RAM[4] = {
+  { "ФЕРМЕНТАЦИЯ", 0, 1 },
+  { "СТАБИЛИЗАЦИЯ", 2, 4 },
+  { "СОЗРЕВАНИЕ", 5, 6 },
+  { "ВЫДЕРЖКА", 7, 9 }
+};
+
+// Селектор групп по имени текущего рецепта (для JSON/логики)
+static inline const GroupDefRAM* getGroupsRAM(size_t& count) {
+  count = 4;
+  if (strcmp(currentProgramName, "ХАМОН") == 0) return G_HAMON_RAM;
+  if (strcmp(currentProgramName, "КОЛБАСА САЛЬЧИЧОН 55 ММ") == 0) return G_SAL_RAM;
+  if (strcmp(currentProgramName, "КОЛБАСА ФУЭТ 28 ММ") == 0) return G_FUET_RAM;
+  if (strcmp(currentProgramName, "КОППА") == 0) return G_KOPPA_RAM;
+  return G_KOPPA_RAM;
+}
+static const uint8_t STX = 0x02;
+static const uint8_t ETX = 0x03;
+static uint8_t sensorRecoveryCounter = 0;
+
+
+
+static const GroupDefPGM G_KOPPA_PGM[4] = {
+  { S_GRP_FERMENT, 0, 1 },
+  { S_GRP_STAB, 2, 8 },
+  { S_GRP_MATURE, 9, 9 },
+  { S_GRP_AGING, 10, 10 }
+};
+static const GroupDefPGM G_HAMON_PGM[4] = {
+  { S_GRP_FERMENT, 0, 2 },
+  { S_GRP_STAB, 3, 4 },
+  { S_GRP_MATURE, 5, 6 },
+  { S_GRP_AGING, 7, 8 }
+};
+static const GroupDefPGM G_SAL_PGM[4] = {
+  { S_GRP_FERMENT, 0, 2 },
+  { S_GRP_STAB, 3, 6 },
+  { S_GRP_MATURE, 7, 8 },
+  { S_GRP_AGING, 9, 10 }
+};
+static const GroupDefPGM G_FUET_PGM[4] = {
+  { S_GRP_FERMENT, 0, 1 },
+  { S_GRP_STAB, 2, 4 },
+  { S_GRP_MATURE, 5, 6 },
+  { S_GRP_AGING, 7, 9 }
+};
+
+static inline const GroupDefPGM* getGroupsPGM() {
+  if (strcmp(currentProgramName, "ХАМОН") == 0) return G_HAMON_PGM;
+  if (strcmp(currentProgramName, "КОЛБАСА САЛЬЧИЧОН 55 ММ") == 0) return G_SAL_PGM;  // было с скобками
+  if (strcmp(currentProgramName, "КОЛБАСА ФУЭТ 28 ММ") == 0) return G_FUET_PGM;      // было с скобками
+  return G_KOPPA_PGM;
+}
+
+// Мини-кэш для обновления только текста "X дней осталось"
+static int g_daysX = 0, g_daysY = 0, g_daysH = 0;
+static uint16_t g_daysBG = 0;
+static unsigned long g_daysLast = 0xFFFFFFFFUL;
+static int g_daysLastW = 0;
+static bool g_daysReady = false;
+
+
+
+// ---------------- Аппаратные объекты ----------------
+TFT_eSPI tft = TFT_eSPI();
+#define FT_RST_PIN -1
+#define FT_INT_PIN -1
+FT6336U ctp(FT_RST_PIN, FT_INT_PIN);
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
+RTC_DS3231 rtc;
+
+// ---------------- Глобальные переменные ----------------
+char g_char_buffer[64];
+Settings settings;
+float currentTemp = NAN, currentHum = NAN;
+float temperatureOnCoolerStart = 0.0f;
+float temperatureSetpointOnCoolerStart = 0.0f;  // NEW: фиксируем уставку на момент пуска
+CuringProgram program;
+// --- Автоповтор для +/- ---
+Button* gHeldPlusMinus = nullptr;
+unsigned long gHoldStartMs = 0;
+unsigned long gHoldLastStepMs = 0;
+
+
+SelectedField selectedField = FIELD_NONE;
+
+bool isFirstSensorRead = true;
+ScreenState currentScreen = SCREEN_MAIN;
+bool forceRedraw = true;
+bool degradedMode = false;
+bool heaterState = false, coolerState = false, humidifierState = false, fanState = false;
+bool settingsDirty = false;
+bool rtcOk = false;
+bool wifiConnected = false;
+bool rtcBatteryFault = false;   // true, если RTC сигнализирует, что терял питание (бит OSF)
+bool shtUseAltAddress = false;  // если перемычку ADDR на модуле замкнёте -> адрес 0x45
+int sensorReadFailCount = 0;
+
+
+
+
+// ---------------- Таймеры ----------------
+unsigned long previousLoopMillis = 0;
+unsigned long sensorReadTimer = 0;
+const unsigned long sensorReadInterval = 2000;
+unsigned long lastTouchTime = 0;
+uint8_t currentBrightness = FULL_BRIGHTNESS;
+unsigned long lastBrightnessChange = 0;
+const unsigned long screenTimeout = 60000;
+unsigned long lastRtcCheck = 0;
+const unsigned long rtcCheckInterval = 60000UL;
+unsigned long lastStatusLogTime = 0;
+uint32_t fanLastRunUnix = 0;     // момент включения вентилятора (RTC ветка), секунды UNIX
+unsigned long fanLastRunMs = 0;  // момент включения вентилятора (fallback ветка), millis
+unsigned long lastSensorRecoveryAttempt = 0;
+unsigned long lastEepromCrcCheck = 0;
+unsigned long lastFanAnimUpdate = 0;
+const unsigned long FAN_ANIM_INTERVAL = 200;
+
+
+// ---------------- Охранные таймеры ----------------
+unsigned long coolerOnTs = 0, coolerOffTs = 0;
+unsigned long heaterOnTs = 0, heaterOffTs = 0;
+unsigned long humidifierOnTs = 0, humidifierOffTs = 0;
+unsigned long lastTempChangeTime = 0;
+float lastChangedTemp = -100.0;
+unsigned long lastHumChangeTime = 0;
+float lastChangedHum = -100.0;
+unsigned long watchdog_checkpoint_A = 0;
+// ---------------- Режим "умной сушки" ----------------
+bool dryingModeActive = false;                                   // Идёт ли сейчас цикл сушки
+unsigned long dryingModeStart = 0;                               // Время старта текущего цикла сушки
+const unsigned long MAX_DRYING_DURATION = 30UL * 60UL * 1000UL;  // Макс. длительность сушки: 30 минут
+const float DRYING_START_THRESHOLD = 7.0f;                       // Насколько % влажность должна превысить цель, чтобы запускать сушку
+
+// --- PID (heater, SSR time-window) ---
+float pidIntegral = 0.0f;
+float pidLastError = 0.0f;
+unsigned long pidWindowStart = 0;
+float pidOutput = 0.0f;  // 0..100 (%)
+static float heaterDemandPct = 0.0f;
+
+// --- Автотюнинг PID ---
+enum AutoTuneState { AT_IDLE,
+                     AT_RUNNING,
+                     AT_DONE,
+                     AT_ABORT };
+AutoTuneState atState = AT_IDLE;
+unsigned long atStartMs = 0;
+unsigned long atLastStepMs = 0;
+uint8_t atProgress = 0;  // 0..100 %
+float atKp = 0, atKi = 0, atKd = 0;
+static const float AUTOTUNE_MAX_TEMP = 40.0f;
+
+
+
+// ---------------- Сигнализация ----------------
+bool lowWaterAlarmActive = false;
+unsigned long humidifierStartTime = 0;
+float humidityOnHumidifierStart = 0.0f;
+bool coolerStuckAlarmActive = false;
+unsigned long lastBlinkTime = 0;
+bool blinkState = false;
+unsigned long lastBeeperToggleTime = 0;
+bool beeperState = false;
+
+
+// ---------------- UI элементы ----------------
+struct CardRect {
+  int x, y, w, h, r;
+};
+CardRect tempCard = { TEMP_CARD_X, CARD_Y, CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS };
+CardRect humCard = { HUM_CARD_X, CARD_Y, CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS };
+CardRect progressCard = { LEFT_PROGRESS_X, PROGRESS_BAR_Y, LEFT_PROGRESS_WIDTH, PROGRESS_BAR_HEIGHT, PROGRESS_BAR_RADIUS };
+CardRect totalProgressCard = { RIGHT_PROGRESS_X, PROGRESS_BAR_Y, RIGHT_PROGRESS_WIDTH, PROGRESS_BAR_HEIGHT, PROGRESS_BAR_RADIUS };
+
+struct Seg {
+  int x, y, w, h, r;
+  int idx;
+  bool pressed;
+  unsigned long pressTime;
+};
+Seg segs[5];
+
+
+float ui_prevTemp = -999, ui_prevHum = -999;
+bool ui_prevHeater = false, ui_prevCooler = false, ui_prevHumid = false, ui_prevFan = false;
+bool ui_prevWifi = false;
+bool uiNeedsUpdate = true;
+
+// ---------------- Кнопки ----------------
+Button btnPidParams{ 15, 235, 450, 40 };     // под уставками
+Button btnPidToggle{ 110, 85, 260, 45 };     // ВКЛ/ВЫКЛ PID
+Button btnPidAutotune{ 110, 140, 260, 45 };  // Автотюнинг
+Button btnPidAbort{ 110, 195, 260, 45 };     // Отмена (если захотите)
+Button btnTestHeater{ 15, 110, 218, 50 };
+Button btnRecipeFuet{ 0, 0, 0, 0 };
+Button btnTestCooler{ 248, 110, 218, 50 };
+Button btnTestHumidifier{ 15, 170, 218, 50 };
+Button btnTestFan{ 248, 170, 218, 50 };
+Button btnHubRecipes{ 15, 50, 450, 40 };
+Button btnHubCalibrate{ 15, 95, 450, 40 };
+Button btnHubHwTest{ 15, 185, 450, 40 };
+Button btnHubSystem{ 15, 140, 200, 40 };
+Button btnSystemCalibrate{ 110, 75, 260, 40 };
+Button btnSystemHwTest{ 110, 175, 260, 40 };
+Button btnSystemClock{ 110, 225, 260, 40 };
+Button btnBack{ SETTINGS_BACK_X, SETTINGS_BACK_Y, SETTINGS_BACK_W, SETTINGS_BACK_H };
+Button btnMode{ SETTINGS_MODE_X, SETTINGS_MODE_Y, SETTINGS_MODE_W, SETTINGS_MODE_H };
+Button btnVal1Minus{ SETTINGS_BTN_MINUS_X, SETTINGS_BTN_Y1, SETTINGS_BTN_W, SETTINGS_BTN_H };
+Button btnVal1Plus{ SETTINGS_BTN_PLUS_X, SETTINGS_BTN_Y1, SETTINGS_BTN_W, SETTINGS_BTN_H };
+Button btnVal2Minus{ SETTINGS_BTN_MINUS_X, SETTINGS_BTN_Y2, SETTINGS_BTN_W, SETTINGS_BTN_H };
+Button btnVal2Plus{ SETTINGS_BTN_PLUS_X, SETTINGS_BTN_Y2, SETTINGS_BTN_W, SETTINGS_BTN_H };
+Button btnSystemEEPROM{ 110, 125, SYSTEM_BTN_WIDTH, SYSTEM_BTN_HEIGHT };
+Button btnSystemBeeper{ 110, 0, SYSTEM_BTN_WIDTH, SYSTEM_BTN_HEIGHT };  // y зададим в drawSystemScreen
+
+// Структура для отслеживания состояния кнопок
+struct ButtonState {
+  Button* btn;
+  bool pressed;
+  unsigned long pressTime;
+};
+ButtonState buttonStates[] = {
+  { &btnMode, false, 0 },
+  { &btnVal1Minus, false, 0 },
+  { &btnVal1Plus, false, 0 },
+  { &btnVal2Minus, false, 0 },
+  { &btnVal2Plus, false, 0 },
+  { &btnBack, false, 0 },
+  { &btnHubRecipes, false, 0 },
+  { &btnHubCalibrate, false, 0 },
+  { &btnHubHwTest, false, 0 },
+  { &btnHubSystem, false, 0 },
+  { &btnSystemCalibrate, false, 0 },
+  { &btnSystemEEPROM, false, 0 },
+  { &btnSystemHwTest, false, 0 },
+  { &btnSystemClock, false, 0 },
+  { &btnSystemBeeper, false, 0 },
+  { &btnTestHeater, false, 0 },
+  { &btnTestCooler, false, 0 },
+  { &btnTestHumidifier, false, 0 },
+  { &btnTestFan, false, 0 },
+  { &btnRecipeFuet, false, 0 },
+  { &btnPidParams, false, 0 },
+  { &btnPidToggle, false, 0 },
+  { &btnPidAutotune, false, 0 },
+  { &btnPidAbort, false, 0 },
+};
+
+const int NUM_BUTTON_STATES = sizeof(buttonStates) / sizeof(buttonStates[0]);
+const int yShift = 2;
+const __FlashStringHelper* degradedModeReason = (const __FlashStringHelper*)S_SENSOR_ERR;
+
+
+// ---------------- Прототипы ----------------
+float computeHeaterPid(float setpoint, float current, float dtSec);
+void resetProgressBarCaches();
+void applyHeaterDemandWindow(unsigned long now);
+void checkCoolerMaxRuntime();
+void applyHeaterSsrWindow(unsigned long nowMs);
+void drawPidScreen(bool fullRedraw);
+void handlePidTouch(int x, int y);
+void setPidEnabled(bool en);
+void startPidAutotune();
+void abortPidAutotune();
+void stepPidAutotune(unsigned long nowMs);
+void stepPidControl(unsigned long nowMs);
+int freeRam();
+void readSensors();
+void controlTemperature(const DateTime& now_dt);
+void controlHumidity(const DateTime& now_dt);
+void controlManualFan(const DateTime& now_dt);
+static uint64_t programElapsedMsUnixOnly();
+static void validateProgramOnBoot();
+void controlDrying(const DateTime& now_dt);
+void startDryingMode();
+void stopDryingMode();
+void checkAndAdvanceProgramStage();
+void checkStuckSensors();
+void checkAnomalousHumidityDrop();
+void checkStuckCooler();
+void checkWatchdog();
+void enterDegradedMode(const __FlashStringHelper* reason);
+void exitDegradedMode();
+void drawDegradedModeOverlay();
+void loadSettings();
+void saveSettings();
+void validateSettings();
+void checkEepromCrc();
+uint16_t calculateCRC(const byte* data, size_t length);
+void processAutoRepeat();
+void processEspUart();
+bool autoRepeatStep(Button* heldBtn);
+unsigned long autoRepeatIntervalMs(unsigned long heldMs);
+void drawEepromWipeScreen(bool fullRedraw);
+void handleEepromWipeTouch(int x, int y);
+void performEepromEraseWithProgress();
+void drawHamonScreen(bool fullRedraw);
+void handleHamonTouch(int x, int y);
+void drawSalchichonScreen(bool fullRedraw);
+void handleSalchichonTouch(int x, int y);
+void drawFuetScreen(bool fullRedraw);
+void handleFuetTouch(int x, int y);
+void buildKoppaProgram(CuringProgram& p);
+void buildHamonProgram(CuringProgram& p);
+void buildSalchichonProgram(CuringProgram& p);
+void buildFuetProgram(CuringProgram& p);
+void drawModeButton(Mode3 mode, bool pressed);
+static void pauseProgramDueToTimeLoss();
+static void resumeProgramAfterTimeRecovery();
+
+
+
+
+// Оптимизация: logEvent ->
+#if DEBUG_SERIAL
+void logEvent(const __FlashStringHelper* message) {
+  Serial.println(message);
+}
+void logEvent(const char* message) {
+  Serial.println(message);
+}
+#else
+void logEvent(const __FlashStringHelper* message) {
+  (void)message;
+}
+void logEvent(const char* message) {
+  (void)message;
+}
+#endif
+
+
+
+void saveProgram();
+void loadProgram();
+void initSegments();
+void drawStaticLayout();
+void drawStatusBar(bool force, const DateTime& now_dt);
+void updateStatusBar(const DateTime& now_dt);
+void drawValueCards();
+void updateValueAreas();
+void drawSegment(int i);
+void drawAllSegments();
+void updateStateIconsIfNeeded();
+bool inBtn(const Button& b, int x, int y);
+uint16_t lerp565(uint16_t a, uint16_t b, float k);
+uint16_t darken565(uint16_t c, float k);
+uint16_t lighten565(uint16_t c, float k);
+uint16_t desaturate565(uint16_t c, float amount);
+void drawVerticalGradientRounded(int x, int y, int w, int h, int r, uint16_t cTop, uint16_t cBottom, int shadowOffset, bool drawShadow, uint16_t shadowColor, uint16_t borderColor, bool depressed);
+void saveAndExitSettings();
+void refreshUI(const DateTime& now_dt);
+void drawSettingsHeader(const char* title_P, bool hasHysteresis);
+void drawHeaterSettingsScreen(bool fullRedraw);
+void drawCoolerSettingsScreen(bool fullRedraw);
+void drawHumidSettingsScreen(bool fullRedraw);
+void drawFanSettingsScreen(bool fullRedraw);
+void drawRecipeScreen(bool fullRedraw);
+void drawSettingsHubScreen(bool fullRedraw);
+void drawCalibrationScreen(bool fullRedraw);
+void drawHwTestScreen(bool fullRedraw);
+void drawFanContent();
+void handleTouch();
+void handleTap(int x, int y);
+void handleRecipeTouch(int x, int y);
+void handleSettingsHubTouch(int x, int y);
+void handleSettingsTouch(int x, int y, ScreenState screen);
+void handleHwTestTouch(int x, int y);
+void updateButtonVisuals();
+void updateFanIcon();
+void iconSettings(int cx, int cy, uint16_t color);
+void iconSun(int cx, int cy, bool active, uint16_t base);
+void iconSnowflake(int cx, int cy, bool active, uint16_t base);
+void iconDrop(int cx, int cy, bool active, uint16_t base);
+void iconFan(int cx, int cy, bool active, uint16_t base);
+void drawWifiIcon(int x, int y, bool connected);
+void drawWaterAlarmIcon(int x, int y);
+void drawBackground();
+void drawSetClockScreen(bool fullRedraw);
+void drawMutedBellIcon(int cx, int cy, uint16_t slashColor);
+void handleSetClockTouch(int x, int y);
+void drawButton(const Button& b, const char* label, uint16_t fill, uint16_t border, bool active = true, bool pressed = false);
+// Обёртка: рисование кнопки с PROGMEM-строкой
+inline void drawButtonP(const Button& b, const char* label_P, uint16_t fill, uint16_t border, bool active = true, bool pressed = false) {
+  strcpy_P(g_char_buffer, label_P);
+  drawButton(b, g_char_buffer, fill, border, active, pressed);
+}
+void drawValueDisplay(int y, const char* label_P, const char* unit_P, float value, uint16_t panelColor);
+void clearFanVariableAreas();
+void drawFanStatusBox();
+void drawFanStatusText();
+void drawSystemScreen(bool fullRedraw);
+void handleSystemTouch(int x, int y);
+void drawClockLabels();
+void drawAllClockPanels();
+void drawKoppaScreen(bool fullRedraw);
+void handleKoppaTouch(int x, int y);
+void drawFieldPanel(SelectedField field, bool isSelected);
+void drawClockFace(bool fullRedraw);
+// Прогресс-бары
+void drawMainProgressBar(bool fullRedraw);
+void drawTotalProgressBar(bool fullRedraw);
+void setHeaterRaw(bool on);
+void setHeater(bool on);
+void setCooler(bool on, bool force = false);
+void setHumidifier(bool on);
+void setFan(bool on);
+void emergencyShutdown();
+
+// ---------------- Текущее время для SET_CLOCK ----------------
+int currentYear = 2025, currentMonth = 9, currentDay = 18;
+int currentHour = 12, currentMinute = 30, currentSecond = 0;
+
+// Новые служебные флаги для логики TZ/редактирования времени
+bool timeFieldsDirty = false;  // менялись ли поля даты/времени на экране
+int8_t tzOnEntry = 0;          // часовой пояс при входе на экран
+
+
+
+
+//------------- ESP8266 bridge (UART) ----------------------
+// Используем Serial3, т.к. DHT уже использует D19 (RX1)
+#define ESP_BRIDGE_SERIAL Serial3
+#define ESP_BRIDGE_BAUD 115200
+
+
+// Период отправки JSON в ESP (мс)
+const unsigned long ESP_SEND_INTERVAL_MS = 1000;
+
+static unsigned long espLastSend = 0;
+
+
+static void requestTimeFromESP() {
+  // МЕГА -> ESP: попросить время
+  const char* payload = "{\"cmd\":\"getTime\"}";
+  ESP_BRIDGE_SERIAL.write(STX);
+  ESP_BRIDGE_SERIAL.write((const uint8_t*)payload, strlen(payload));
+  ESP_BRIDGE_SERIAL.write(ETX);
+}
+
+
+
+
+
+// === elapsed строго по RTC/UNIX; при отсутствии времени -> 0 (это значит "пауза") ===
+static uint64_t programElapsedMsUnixOnly() {
+  if (!program.active) return 0ULL;
+  if (!rtcOk) return 0ULL;
+  if (program.startUnixTime == 0) return 0ULL;
+
+  uint32_t nowU = rtc.now().unixtime();
+  if (nowU < program.startUnixTime) return 0ULL;  // защита от "времени назад"
+  return (uint64_t)(nowU - program.startUnixTime) * 1000ULL;
+}
+
+
+
+
+void sendEspJsonStatus() {
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(espLastSend, now) < ESP_SEND_INTERVAL_MS) return;
+  espLastSend = now;
+
+  float t = currentTemp + settings.tempBias;
+  float h = currentHum + settings.humBias;
+  float tt = program.active ? program.stages[program.currentStage].targetTemp : settings.targetTemp;
+  float th = program.active ? program.stages[program.currentStage].targetHum : settings.targetHum;
+
+  int heater = heaterState ? 1 : 0;
+  int cooler = coolerState ? 1 : 0;
+  int humid = humidifierState ? 1 : 0;
+  int fan = fanState ? 1 : 0;
+
+  const char* heaterModeS = modeToString(settings.heaterMode);
+  const char* coolerModeS = modeToString(settings.coolerMode);
+  const char* humidModeS = modeToString(settings.humidMode);
+  const char* fanModeS = modeToString(settings.fanMode);
+
+  char progName[64];
+  char stageName[32] = "—";
+  int stageIndex = 0;
+  int totalStages = 0;
+  unsigned long elapsedSec = 0;
+  unsigned long remainingSec = 0;
+  int stagePercent = 0;
+  int overallPercent = 0;
+  unsigned long stageTotalHoursUL = 0;
+  unsigned long stageElapsedHoursUL = 0;
+
+  strncpy(progName, currentProgramName, sizeof(progName) - 1);
+  progName[sizeof(progName) - 1] = '\0';
+  if (program.active && (progName[0] == '\0' || strcmp(progName, "—") == 0)) {
+    strncpy(progName, "КОППА", sizeof(progName) - 1);
+    progName[sizeof(progName) - 1] = '\0';
+  }
+
+  uint64_t totalElapsed = programElapsedMsUnixOnly();
+
+  if (program.active) {
+    totalStages = (int)program.stageCount;
+    stageIndex = (int)program.currentStage + 1;
+    elapsedSec = (unsigned long)(totalElapsed / 1000ULL);
+
+    uint64_t totalDurationMillis = 0;
+    for (uint8_t s = 0; s < program.stageCount; s++) {
+      totalDurationMillis += (uint64_t)program.stages[s].durationHours * MILLIS_PER_HOUR;
+    }
+    remainingSec = (totalElapsed < totalDurationMillis) ? (unsigned long)((totalDurationMillis - totalElapsed) / 1000ULL) : 0;
+
+    if (totalDurationMillis > 0) {
+      overallPercent = (int)((totalElapsed * 100ULL) / totalDurationMillis);
+      if (overallPercent > 100) overallPercent = 100;
+    }
+
+    size_t gCount = 0;
+    const GroupDefRAM* GR = getGroupsRAM(gCount);
+    int currentGroup = -1;
+    for (size_t g = 0; g < gCount; g++) {
+      if (program.currentStage >= GR[g].start && program.currentStage <= GR[g].end) {
+        strncpy(stageName, GR[g].name, sizeof(stageName) - 1);
+        stageName[sizeof(stageName) - 1] = '\0';
+        currentGroup = (int)g;
+        break;
+      }
+    }
+    if (currentGroup >= 0) {
+      uint64_t groupTotal = 0, groupStart = 0;
+      for (uint8_t s = 0; s < program.stageCount; s++) {
+        uint64_t dur = (uint64_t)program.stages[s].durationHours * MILLIS_PER_HOUR;
+        if (s < GR[currentGroup].start) groupStart += dur;
+        if (s >= GR[currentGroup].start && s <= GR[currentGroup].end) groupTotal += dur;
+      }
+      uint64_t groupElapsed = totalElapsed > groupStart ? totalElapsed - groupStart : 0;
+
+      if (groupTotal > 0) {
+        stagePercent = (int)((groupElapsed * 100ULL) / groupTotal);
+        if (stagePercent > 100) stagePercent = 100;
+      }
+      stageTotalHoursUL = (unsigned long)(groupTotal / MILLIS_PER_HOUR);
+      stageElapsedHoursUL = (unsigned long)(groupElapsed / MILLIS_PER_HOUR);
+      if (stageElapsedHoursUL > stageTotalHoursUL) stageElapsedHoursUL = stageTotalHoursUL;
+    }
+  }
+
+  char tS[12], hS[12], ttS[12], thS[12];
+  dtostrf(t, 0, 1, tS);
+  dtostrf(h, 0, 1, hS);
+  dtostrf(tt, 0, 1, ttS);
+  dtostrf(th, 0, 1, thS);
+
+  char out[520];
+  int n = snprintf(out, sizeof(out),
+                   "{\"temp\":%s,\"hum\":%s,\"targetT\":%s,\"targetH\":%s,"
+                   "\"heater\":%d,\"cooler\":%d,\"humid\":%d,\"fan\":%d,"
+                   "\"heaterMode\":\"%s\",\"coolerMode\":\"%s\",\"humidMode\":\"%s\",\"fanMode\":\"%s\","
+                   "\"progName\":\"%s\",\"stageName\":\"%s\",\"stageIndex\":%d,\"stages\":%d,"
+                   "\"elapsed\":%lu,\"remaining\":%lu,\"percent\":%d,\"stagePercent\":%d,"
+                   "\"stageTotalHours\":%lu,\"stageElapsedHours\":%lu,"
+                   "\"lowWaterAlarm\":%d,\"coolerStuckAlarm\":%d,\"degradedMode\":%d}",
+                   tS, hS, ttS, thS,
+                   heater, cooler, humid, fan,
+                   heaterModeS, coolerModeS, humidModeS, fanModeS,
+                   progName, stageName, stageIndex, totalStages,
+                   elapsedSec, remainingSec, overallPercent, stagePercent,
+                   stageTotalHoursUL, stageElapsedHoursUL,
+                   lowWaterAlarmActive ? 1 : 0,
+                   coolerStuckAlarmActive ? 1 : 0,
+                   degradedMode ? 1 : 0);
+
+#if DEBUG_SERIAL
+  if (n > 0 && n < (int)sizeof(out)) {
+    Serial.print(F("[TO ESP] "));
+    Serial.println(out);
+  } else {
+    Serial.println(F("[TO ESP] ERROR: JSON truncated, increase buffer"));
+  }
+#endif
+
+  if (n <= 0 || n >= (int)sizeof(out)) return;  // не шлём усечённый JSON
+
+  ESP_BRIDGE_SERIAL.write(STX);
+  ESP_BRIDGE_SERIAL.write((const uint8_t*)out, (size_t)n);
+  ESP_BRIDGE_SERIAL.write(ETX);
+}
+
+
+// ======= Приём команд от ESP (STX/ETX + JSON) на Mega =======
+
+
+static char espRxBuf[350];  // размер подберите под максимальный JSON
+static size_t espRxLen = 0;
+static bool espRxInFrame = false;
+
+static Mode3 modeFromString(const char* s) {
+  if (!s || !*s) return MODE_AUTO;
+  if (!strcmp(s, "AUTO")) return MODE_AUTO;
+  if (!strcmp(s, "ON")) return MODE_ON;
+  if (!strcmp(s, "OFF")) return MODE_OFF;
+  if (!strcmp(s, "TIMED")) return MODE_TIMED;
+  return MODE_AUTO;
+}
+
+static void applyDeviceMode(const char* target, Mode3 m) {
+  if (!target) return;
+
+  if (!strcmp(target, "heater")) {
+    // Если уходим из AUTO (PID-режима) в ON/OFF — обязательно гасим SSR raw,
+    // чтобы он не остался "залипшим" после PID-окна.
+    if (m != MODE_AUTO) {
+      heaterDemandPct = 0.0f;
+      pidOutput = 0.0f;
+      setHeaterRaw(false);
+      unsigned long now = millis();
+      heaterOffTs = now;
+      heaterOnTs = 0;
+    }
+
+    settings.heaterMode = m;
+
+    if (m == MODE_ON) setHeater(true);
+    else if (m == MODE_OFF) setHeater(false);
+    // MODE_AUTO — дальше разрулит controlTemperature/stepPidControl
+  }
+
+  else if (!strcmp(target, "cooler")) {
+    settings.coolerMode = m;
+    if (m == MODE_ON) setCooler(true);
+    else if (m == MODE_OFF) setCooler(false);
+  } else if (!strcmp(target, "humidifier")) {
+    settings.humidMode = m;
+    if (m == MODE_ON) setHumidifier(true);
+    else if (m == MODE_OFF) setHumidifier(false);
+  } else if (!strcmp(target, "fan")) {
+    settings.fanMode = m;
+    if (m == MODE_ON) setFan(true);
+    else if (m == MODE_OFF) setFan(false);
+  }
+}
+
+// === Запуск программы по имени (ИСПРАВЛЕНО: запрет старта при !rtcOk) ===
+static void startProgramByName(const char* recipe) {
+  if (!recipe) return;
+
+  // ИСПРАВЛЕНО: запрещаем запуск при невалидном RTC
+  if (!rtcOk) {
+    logEvent(F("Program start denied: RTC invalid. Please set clock or wait NTP."));
+    return;
+  }
+
+  if (!strcmp(recipe, "KOPPA") || !strcmp(recipe, "КОППА")) {
+    buildKoppaProgram(program);
+    setCurrentProgramName("КОППА");
+  } else if (!strcmp(recipe, "HAMON") || !strcmp(recipe, "ХАМОН")) {
+    buildHamonProgram(program);
+    setCurrentProgramName("ХАМОН");
+  } else if (!strcmp(recipe, "SALCHICHON") || !strcmp(recipe, "САЛЬЧИЧОН")) {
+    buildSalchichonProgram(program);
+    setCurrentProgramName("КОЛБАСА САЛЬЧИЧОН 55 ММ");
+  } else if (!strcmp(recipe, "FUET") || !strcmp(recipe, "ФУЭТ")) {
+    buildFuetProgram(program);
+    setCurrentProgramName("КОЛБАСА ФУЭТ 28 ММ");
+  } else {
+    return;
+  }
+
+  program.active = true;
+  program.currentStage = 0;
+  program.startMillis = 0;  // предпочтительно использовать только UNIX, чтобы не путаться при перезапуске
+  program.startUnixTime = rtcOk ? rtc.now().unixtime() : 0;
+  // ← ДОБАВИТЬ ПРОВЕРКУ:
+  if (program.startUnixTime == 0) {
+    logEvent(F("ERROR:  Failed to get valid UNIX time. Program NOT started! "));
+    program.active = false;  // Отменить запуск!
+    return;
+  }
+
+
+
+  // применяем уставки первого этапа
+  settings.targetTemp = program.stages[0].targetTemp;
+  settings.targetHum = program.stages[0].targetHum;
+  settings.manualFanIntervalHours = program.stages[0].fanInterval;
+  settings.manualFanDurationMinutes = program.stages[0].fanDuration;
+  settingsDirty = true;
+  saveSettings();
+  saveProgram();
+
+  uiNeedsUpdate = true;
+  forceRedraw = true;
+}
+
+
+static void stopProgramAndReset() {
+  program.active = false;
+  program.currentStage = 0;
+  program.startMillis = 0;
+  program.startUnixTime = 0;
+  setCurrentProgramName("—");
+
+  // безопасные уставки
+  settings.targetTemp = 15.0f;
+  settings.targetHum = 50.0f;
+  settingsDirty = true;
+  saveSettings();
+  saveProgram();
+
+  uiNeedsUpdate = true;
+  forceRedraw = true;
+}
+
+// ======== ПРИЁМ КОМАНД ОТ ESP: JSON-команды ========
+
+static void processEspJsonCommand(const char* json) {
+  StaticJsonDocument<384> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    logEvent(F("ESP CMD: JSON parse error"));
+    return;
+  }
+
+  // Статус Wi‑Fi: {"wifi":1|0}
+  if (doc.containsKey("wifi")) {
+    bool newWifiConnected = (doc["wifi"].as<int>() != 0);
+    // фиксируем время последнего статуса
+    lastEspStatusTime = millis();
+
+    // Детект фронта Wi-Fi: с 0 -> 1
+    if (newWifiConnected && !prevWifiConnectedFlag) {
+      // При каждом новом подключении Wi‑Fi обязательно перезапрашиваем время
+      requestTimeFromESP();
+      ntpSyncDone = false;  // форсируем отметку, что ждём новое время
+    }
+    prevWifiConnectedFlag = newWifiConnected;
+    wifiConnected = newWifiConnected;
+    uiNeedsUpdate = true;
+    logEvent(wifiConnected ? F("ESP STAT: WIFI=1") : F("ESP STAT: WIFI=0"));
+    return;
+  }
+
+
+
+  const char* cmd = doc["cmd"] | "";
+  if (!*cmd) {
+    logEvent(F("ESP CMD: empty cmd"));
+    return;
+  }
+
+  // 7) Приём времени от ESP: использовать выбранный часовой пояс, вместо жёсткого +3
+  if (!strcmp(cmd, "time")) {
+    uint32_t unixTime = doc["unix"] | 0UL;
+    if (unixTime > UNIX_TIME_MIN_VALID) {  // > 2021-01-01
+      // НОВОЕ: применяем settings.tzOffsetHours (−12…+14)
+      rtc.adjust(DateTime(unixTime + (long)settings.tzOffsetHours * 3600L));
+      rtcOk = true;
+      rtcBatteryFault = false;  // OSF сброшен adjust()
+      ntpSyncDone = true;       // отметка — NTP-время принято
+      lastNtpSyncMs = millis();
+
+      DateTime now = rtc.now();
+      lastDailySyncDay = now.day();
+      drawStatusBar(true, now);
+      logEvent(F("RTC updated from ESP/NTP (with TZ)"));
+    } else {
+      logEvent(F("ESP CMD: time invalid or too small"));
+    }
+    return;
+  }
+
+
+  // Устройства: {"cmd":"device","target":"heater|cooler|humidifier|fan","mode":"AUTO|ON|OFF|TIMED"}
+  if (!strcmp(cmd, "device")) {
+    const char* target = doc["target"] | "";
+    const char* modeS = doc["mode"] | "AUTO";
+    {
+      char dbg[120];
+      snprintf(dbg, sizeof(dbg), "ESP CMD: device %s %s", target, modeS);
+      logEvent(dbg);
+    }
+    Mode3 m = modeFromString(modeS);
+    applyDeviceMode(target, m);
+    settingsDirty = true;
+    saveSettings();
+    uiNeedsUpdate = true;
+    return;
+  }
+
+  // Уставки: {"cmd":"targets","targetT":..,"targetH":..}
+  if (!strcmp(cmd, "targets")) {
+    if (doc.containsKey("targetT")) settings.targetTemp = doc["targetT"].as<float>();
+    if (doc.containsKey("targetH")) settings.targetHum = doc["targetH"].as<float>();
+    settingsDirty = true;
+    validateSettings();
+    saveSettings();
+    logEvent(F("ESP CMD: targets updated"));
+    uiNeedsUpdate = true;
+    return;
+  }
+
+  // Таймер вентилятора: {"cmd":"fanTimed","intervalHours":..,"durationMinutes":..}
+  if (!strcmp(cmd, "fanTimed")) {
+    if (doc.containsKey("intervalHours")) settings.manualFanIntervalHours = (uint16_t)doc["intervalHours"].as<int>();
+    if (doc.containsKey("durationMinutes")) settings.manualFanDurationMinutes = (uint16_t)doc["durationMinutes"].as<int>();
+    settingsDirty = true;
+    validateSettings();
+    saveSettings();
+    logEvent(F("ESP CMD: fan timed updated"));
+    uiNeedsUpdate = true;
+    return;
+  }
+
+  // Программа: {"cmd":"program","action":"start|stop","recipe":"..."}
+  if (!strcmp(cmd, "program")) {
+    const char* action = doc["action"] | "";
+    if (!strcmp(action, "start")) {
+      if (!rtcOk) {
+        logEvent(F("ESP CMD: program start denied (RTC invalid). Set clock/NTP first."));
+        return;
+      }
+      const char* recipe = doc["recipe"] | "";
+      startProgramByName(recipe);
+      logEvent(F("ESP CMD: program start"));
+      uiNeedsUpdate = true;
+      return;
+    } else if (!strcmp(action, "stop")) {
+      stopProgramAndReset();
+      logEvent(F("ESP CMD: program stop"));
+      uiNeedsUpdate = true;
+      return;
+    }
+  }
+
+  logEvent(F("ESP CMD: unknown command"));
+}
+
+
+// ======================================================================
+//                              SETUP
+void setup() {
+  // Ранний сторожевой таймер и фиксация причины предыдущего ресета
+  wdt_disable();
+  uint8_t mcusr_copy = MCUSR;
+  MCUSR = 0;
+  wdt_enable(WDTO_8S);
+  wdt_reset();
+
+#if DEBUG_SERIAL
+  Serial.begin(115200);
+  delay(200);
+  Serial.print(F("[BOOT] Reset cause MCUSR=0b"));
+  Serial.println(mcusr_copy, BIN);
+  if (mcusr_copy & _BV(WDRF)) Serial.println(F("[BOOT] WDRF (watchdog reset)"));
+  if (mcusr_copy & _BV(BORF)) Serial.println(F("[BOOT] BORF (brown-out)"));
+  if (mcusr_copy & _BV(EXTRF)) Serial.println(F("[BOOT] EXTRF (external reset)"));
+  if (mcusr_copy & _BV(PORF)) Serial.println(F("[BOOT] PORF (power-on reset)"));
+  if (mcusr_copy & _BV(JTRF)) Serial.println(F("[BOOT] JTRF (JTAG reset)"));
+#endif
+
+  // --- UART‑мост к ESP8266 ---
+  ESP_BRIDGE_SERIAL.begin(ESP_BRIDGE_BAUD);
+  lastTimeReqMs = millis() - TIME_REQ_INTERVAL_MS;
+  ntpSyncDone = false;
+  prevWifiConnectedFlag = false;
+  logEvent(F("ESP bridge (Serial3) started @115200"));
+  requestTimeFromESP();
+
+  // --- TFT ---
+  tft.init();
+  tft.setRotation(3);
+
+  // --- I2C ---
+  Wire.begin();
+  Wire.setClock(400000L);
+  Wire.setWireTimeout(2000, true);
+
+  // --- FT6336U (ёмкостной тач) ---
+  ctp.begin();
+  logEvent(F("FT6336U begin() called"));
+  {
+    uint8_t chip = ctp.read_chip_id();
+    char buf[32];
+    snprintf(buf, sizeof(buf), "FT6336U Chip ID: 0x%02X", chip);
+    logEvent(buf);
+  }
+
+  // --- RTC ---
+  if (!rtc.begin()) {
+    rtcOk = false;
+    logEvent(F("ОШИБКА: Не удалось инициализировать RTC"));
+  } else {
+    rtcOk = true;
+    DateTime now = rtc.now();
+    rtcBatteryFault = rtc.lostPower();
+    if (now.year() < 2025 || now.year() > 2099 || now.month() < 1 || now.month() > 12) {
+      rtcOk = false;
+      logEvent(F("Предупреждение: Время RTC невалидно"));
+    }
+  }
+
+  // --- Тема/оформление ---
+  loadThemeCache();
+  darkGreenMode = TCache.darkGreenMode;  // FIX: инициализация цвета для MODE_AUTO
+  // --- Датчики SHT31 ---
+  if (!sht31.begin(shtUseAltAddress ? 0x45 : 0x44)) {
+    logEvent(F("SHT31 не найден по I2C"));
+    enterDegradedMode((const __FlashStringHelper*)S_SENSOR_ERR);
+  } else {
+    logEvent(F("SHT31 init OK"));
+  }
+
+  // Первичное чтение датчиков и конфиг
+  readSensors();
+  loadSettings();
+  loadProgram();
+  validateProgramOnBoot();
+
+  // --- Пины выходов (реле, баззер) ---
+  // ВАЖНО: сначала выставляем безопасные уровни OFF (HIGH для active-low),
+  // потом переводим пины в OUTPUT. Это снижает риск глитча включения.
+  digitalWrite(FAN_PIN, HIGH);
+  digitalWrite(HEATER_PIN, HIGH);
+  digitalWrite(COOLER_PIN, HIGH);
+  digitalWrite(HUMIDIFIER_PIN, HIGH);
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  pinMode(FAN_PIN, OUTPUT);
+  pinMode(HEATER_PIN, OUTPUT);
+  pinMode(COOLER_PIN, OUTPUT);
+  pinMode(HUMIDIFIER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // --- Подсветка ---
+  pinMode(BACKLIGHT_PIN, OUTPUT);
+  analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+  lastBrightnessChange = millis();
+
+  // --- Таймеры и начальные значения ---
+  fanLastRunMs = millis();
+  fanLastRunUnix = rtcOk ? (uint32_t)rtc.now().unixtime() : 0;
+  lastTempChangeTime = lastHumChangeTime = millis();
+  lastTouchTime = millis();
+  coolerOffTs = millis() - COOLER_MIN_OFF_TIME;
+  heaterOffTs = millis() - HEATER_COOLER_LOCKOUT_TIME;
+  humidifierOffTs = millis() - HUMIDIFIER_MIN_OFF_TIME;
+  watchdog_checkpoint_A = millis();
+  lastEepromCrcCheck = millis();
+
+  // Первое чтение датчиков (без delay)
+  readSensors();
+
+  // Управление климатом до первой отрисовки
+  DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+  controlManualFan(now_dt);
+  controlTemperature(now_dt);
+  controlHumidity(now_dt);
+
+  ui_prevFan = fanState;
+  ui_prevHeater = heaterState;
+  ui_prevCooler = coolerState;
+  ui_prevHumid = humidifierState;
+
+  // --- UI: сегменты, главный экран ---
+  initSegments();
+  forceRedraw = true;
+  uiNeedsUpdate = true;
+  drawStaticLayout();
+  forceRedraw = false;
+  uiNeedsUpdate = false;
+
+  if (degradedMode) {
+    drawDegradedModeOverlay();
+  }
+
+  logEvent(F("Сторожевой таймер активирован (ранний старт)"));
+}
+
+
+// ======================================================================
+//                              LOOP
+// ======================================================================
+
+void loop() {
+  wdt_reset();
+  checkWatchdog();
+  unsigned long now = millis();
+  DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+
+  // === ВЫСОКОСКОРОСТНОЙ БЛОК ДЛЯ SSR И AUTOTUNE ===
+  if (!degradedMode && currentScreen != SCREEN_HW_TEST) {
+
+    // 0) Autotune сам управляет нагревом через setHeaterRaw()
+    if (atState == AT_RUNNING) {
+      stepPidAutotune(now);
+    } else {
+
+      // PID-SSR режим (нагрев управляется только SSR-окном)
+      const bool pidSsrMode =
+        settings.pidEnabled && settings.heaterMode == MODE_AUTO && !dryingModeActive && !degradedMode && currentScreen != SCREEN_HW_TEST;
+
+      // 1) Если PID-SSR активен — обновляем PID математику (внутри stepPidControl есть свой sample time)
+      if (pidSsrMode) {
+        stepPidControl(now);  // обновит pidOutput и heaterDemandPct
+      }
+
+      // 2) SSR-окно обслуживаем ТОЛЬКО когда оно действительно нужно
+      const bool needSsrWindow = (dryingModeActive || pidSsrMode);
+
+      if (needSsrWindow) {
+        applyHeaterDemandWindow(now);
+      } else {
+        // ВАЖНО: чтобы SSR-окно точно не “подхватило” старый demand из памяти
+        heaterDemandPct = 0.0f;
+        // НЕ трогаем setHeaterRaw(false) здесь!
+        // Нагревом управляет обычная логика setHeater() в controlTemperature()
+      }
+    }
+  }
+
+
+
+
+
+  // ===============================================
+
+
+  // Heartbeat каждые HEARTBEAT_INTERVAL_MS
+  if (DEBUG_SERIAL) {
+    if (SAFE_MILLIS_DIFF(lastHeartbeatLog, now) > HEARTBEAT_INTERVAL_MS) {
+      lastHeartbeatLog = now;
+      char buf[190];
+      int fr = freeRam();
+      unsigned long sinceWatchdogPulse = SAFE_MILLIS_DIFF(watchdog_checkpoint_A, now);
+      snprintf(buf, sizeof(buf),
+               "[HB] t=%lu ram=%d rtcOk=%d wifi=%d degr=%d lowWater=%d coolStuck=%d "
+               "T=%.1f H=%.1f heater=%d cooler=%d humid=%d fan=%d sincePulse=%lu PID=%.1f%%",
+               now, fr, rtcOk, wifiConnected, degradedMode,
+               lowWaterAlarmActive, coolerStuckAlarmActive,
+               currentTemp + settings.tempBias,
+               currentHum + settings.humBias,
+               heaterState, coolerState, humidifierState, fanState,
+               sinceWatchdogPulse, pidOutput);  // Добавил вывод PID в лог
+      Serial.println(buf);
+    }
+  }
+
+  // --- RTC проверки ---
+  if (rtcOk && (now_dt.year() < 2025 || now_dt.year() > 2099 || now_dt.month() > 12)) {
+    rtcOk = false;
+    requestTimeFromESP();
+    lastTimeReqMs = now;
+  }
+  if (SAFE_MILLIS_DIFF(lastRtcCheck, now) > rtcCheckInterval || !rtcOk) {
+    lastRtcCheck = now;
+    rtcOk = rtc.begin();
+    now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+    if (rtcOk) {
+      rtcBatteryFault = rtc.lostPower();
+    }
+    uiNeedsUpdate = true;
+  }
+  // >>> ВСТАВИТЬ ЭТОТ БЛОК ПОСЛЕ RTC-ПРОВЕРКИ <<<
+  {
+    static bool rtcPauseLogged = false;
+    if (!rtcOk && program.active) {
+      if (!rtcPauseLogged) {
+        logEvent(F("RTC lost while program active — pausing stage advancement until RTC recovers"));
+        rtcPauseLogged = true;
+      }
+      // Ничего не сбрасываем: этапы и так не двигаются при !rtcOk.
+    } else if (rtcOk) {
+      rtcPauseLogged = false;  // при восстановлении RTC снимаем флаг
+    }
+  }
+
+  // --- СИНХРОНИЗАЦИЯ ВРЕМЕНИ С ESP ---
+  if (wifiConnected && (!ntpSyncDone || !rtcOk)) {
+    if (SAFE_MILLIS_DIFF(lastTimeReqMs, now) >= TIME_REQ_INTERVAL_MS) {
+      lastTimeReqMs = now;
+      requestTimeFromESP();
+    }
+  }
+  if (rtcOk && wifiConnected) {
+    if (now_dt.hour() == 3 && lastDailySyncDay != now_dt.day()) {
+      requestTimeFromESP();
+      lastDailySyncDay = now_dt.day();
+    }
+  }
+  if (wifiConnected && SAFE_MILLIS_DIFF(lastNtpSyncMs, now) >= 86400000UL) {
+    requestTimeFromESP();
+    lastNtpSyncMs = now;
+  }
+
+  // --- Подсветка ---
+  unsigned long touchDiff = SAFE_MILLIS_DIFF(lastTouchTime, now);
+  bool anyAlarmActive = lowWaterAlarmActive || coolerStuckAlarmActive || degradedMode;
+  unsigned long dimTimeout = anyAlarmActive ? ALARM_BRIGHTNESS_DIM_TIMEOUT : BRIGHTNESS_DIM_TIMEOUT;
+
+  if (touchDiff > dimTimeout) {
+    if (currentBrightness != 0) {
+      analogWrite(BACKLIGHT_PIN, 0);
+      currentBrightness = 0;
+      lastBrightnessChange = now;
+    }
+  } else {
+    if (currentBrightness != FULL_BRIGHTNESS) {
+      analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+      currentBrightness = FULL_BRIGHTNESS;
+      lastBrightnessChange = now;
+    }
+  }
+
+  // --- Анимация вентилятора ---
+  if (fanState && currentScreen == SCREEN_MAIN && SAFE_MILLIS_DIFF(lastFanAnimUpdate, now) >= FAN_ANIM_INTERVAL) {
+    lastFanAnimUpdate = now;
+    updateFanIcon();
+  }
+
+  // --- Выход из настроек по таймауту ---
+  if (currentScreen != SCREEN_MAIN && currentScreen != SCREEN_HW_TEST && currentScreen != SCREEN_PID && touchDiff > screenTimeout)
+    saveAndExitSettings();  // добавил исключение для PID, чтобы видеть процесс тюнинга, если надо
+
+  // --- Проверка CRC EEPROM ---
+  if (SAFE_MILLIS_DIFF(lastEepromCrcCheck, now) > EEPROM_CRC_CHECK_INTERVAL) {
+    checkEepromCrc();
+    lastEepromCrcCheck = now;
+  }
+
+  // --- Тревоги (бипер и мигание) ---
+  if (anyAlarmActive) {
+    if (SAFE_MILLIS_DIFF(lastBlinkTime, now) > 400) {
+      lastBlinkTime = now;
+      blinkState = !blinkState;
+      uiNeedsUpdate = true;
+    }
+    if (SAFE_MILLIS_DIFF(lastBeeperToggleTime, now) > BEEPER_INTERVAL) {
+      lastBeeperToggleTime = now;
+      if (settings.beeperEnabled) {
+        beeperState = !beeperState;
+        digitalWrite(BUZZER_PIN, beeperState ? LOW : HIGH);
+      } else {
+        beeperState = false;
+        digitalWrite(BUZZER_PIN, HIGH);
+      }
+    }
+  }
+
+  // --- SET_CLOCK мигание ---
+  if (currentScreen == SCREEN_SET_CLOCK && selectedField != FIELD_NONE && SAFE_MILLIS_DIFF(lastBlinkTime, now) > 400) {
+    lastBlinkTime = now;
+    blinkState = !blinkState;
+    drawSetClockScreen(false);
+  }
+
+  // --- Чтение датчиков ---
+  if (SAFE_MILLIS_DIFF(sensorReadTimer, now) > sensorReadInterval) {
+    sensorReadTimer = now;
+    readSensors();
+    emergencyShutdown();
+  }
+
+  // --- Логирование ---
+  if (SAFE_MILLIS_DIFF(lastStatusLogTime, now) > STATUS_LOG_INTERVAL) {
+    lastStatusLogTime = now;
+    // ... ваш лог ...
+  }
+
+  // --- ОСНОВНОЙ КЛИМАТ-КОНТРОЛЬ (МЕДЛЕННЫЙ ЦИКЛ) ---
+  if (!degradedMode && currentScreen != SCREEN_HW_TEST && SAFE_MILLIS_DIFF(previousLoopMillis, now) > 1000) {
+    previousLoopMillis = now;
+    static unsigned long lastTemperatureControl = 0, lastHumidityControl = 0;
+
+    if (dryingModeActive) {
+      if (SAFE_MILLIS_DIFF(lastTemperatureControl, now) > 10000) {
+        controlDrying(now_dt);
+        lastTemperatureControl = now;
+      }
+    } else {
+      // Обычная логика
+      if (SAFE_MILLIS_DIFF(lastTemperatureControl, now) > 10000) {
+        controlTemperature(now_dt);  // ТУТ ТЕПЕРЬ ТОЛЬКО РАСЧЕТ PID, НЕ УПРАВЛЕНИЕ РЕЛЕ
+        lastTemperatureControl = now;
+      }
+      if (SAFE_MILLIS_DIFF(lastHumidityControl, now) > 10000) {
+        controlHumidity(now_dt);
+        checkAnomalousHumidityDrop();
+        lastHumidityControl = now;
+      }
+
+      // Условие старта сушки
+      float humSet = settings.targetHum;
+      if (program.active && program.currentStage < program.stageCount) {
+        humSet = program.stages[program.currentStage].targetHum;
+      }
+      float calibratedHum = currentHum + settings.humBias;
+
+      if (calibratedHum > humSet + DRYING_START_THRESHOLD) {
+        startDryingMode();
+      }
+    }
+
+    // Проверка зависших датчиков
+    static unsigned long lastSensorsCheck = 0;
+    if (SAFE_MILLIS_DIFF(lastSensorsCheck, now) > 60000UL) {
+      checkStuckSensors();
+      lastSensorsCheck = now;
+    }
+    checkCoolerMaxRuntime();
+    checkStuckCooler();
+    watchdog_checkpoint_A = now;
+  }
+
+
+
+  // --- Программа (этапы) ---
+  static unsigned long lastStageTick = 0;
+  if (SAFE_MILLIS_DIFF(lastStageTick, now) >= 1000UL) {
+    lastStageTick = now;
+    checkAndAdvanceProgramStage();
+  }
+
+  // --- UI по минутам/дням ---
+  static uint8_t lastMinuteLoop = 99, lastDayLoop = 99;
+  if (rtcOk && (now_dt.minute() != lastMinuteLoop || now_dt.day() != lastDayLoop)) {
+    uiNeedsUpdate = true;
+    lastMinuteLoop = now_dt.minute();
+    lastDayLoop = now_dt.day();
+  }
+
+  // --- Обновление UI ---
+  if (uiNeedsUpdate) {
+    if (currentScreen == SCREEN_MAIN) refreshUI(now_dt);
+    else if (currentScreen == SCREEN_HW_TEST) drawHwTestScreen(false);
+    else if (currentScreen == SCREEN_KOPPA) drawKoppaScreen(false);
+    else if (currentScreen == SCREEN_PID) drawPidScreen(forceRedraw);  // PID экран
+    uiNeedsUpdate = false;
+  }
+
+  sendEspJsonStatus();
+  processEspUart();
+
+  // --- Прогресс-бары ---
+  // В деградированном режиме НЕ перерисовываем бары, чтобы они не "проступали" сквозь оверлей.
+  if (!degradedMode && program.active && currentScreen == SCREEN_MAIN) {
+    static unsigned long lastProgressUpdate = 0;
+    if (SAFE_MILLIS_DIFF(lastProgressUpdate, millis()) > 10000) {
+      drawMainProgressBar(false);
+      drawTotalProgressBar(false);
+      lastProgressUpdate = millis();
+    }
+  }
+
+  handleTouch();
+  processAutoRepeat();
+
+  bool buttonsNeedUpdate = false;
+  for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+    if (buttonStates[i].pressed) {
+      buttonsNeedUpdate = true;
+      break;
+    }
+  }
+
+  if (buttonsNeedUpdate) {
+    updateButtonVisuals();
+  }
+
+  watchdog_checkpoint_A = now;
+}
+
+// ======================================================================
+//                     КОНТРОЛЬ И ИСПОЛНИТЕЛИ
+// ======================================================================
+void setHeater(bool on) {
+  // В режиме сушки разрешаем одновременную работу нагрева и охлаждения,
+  // поэтому часть взаимоблокировок пропускаем.
+  unsigned long now = millis();
+
+  if (dryingModeActive && currentScreen != SCREEN_HW_TEST) {
+    // Уважаем только минимальные времена ВКЛ/ВЫКЛ для защиты реле/ТЭНа.
+    if (!on && SAFE_MILLIS_DIFF(heaterOnTs, now) < MIN_HEATER_ON_TIME) {
+      logEvent(F("Нагрев (сушка): не выключен — мин. время работы"));
+      return;
+    }
+    if (on && SAFE_MILLIS_DIFF(heaterOffTs, now) < HEATER_MIN_OFF_TIME) {
+      logEvent(F("Нагрев (сушка): не включен — мин. время выключения"));
+      return;
+    }
+
+    if (on == heaterState) return;
+
+    digitalWrite(HEATER_PIN, on ? LOW : HIGH);
+    heaterState = on;
+    uiNeedsUpdate = true;
+    if (on) {
+      heaterOnTs = now;
+    } else {
+      heaterOffTs = now;
+      heaterOnTs = 0;
+    }
+
+    // Авто‑вентилятор при сушке тоже можно поддерживать
+    if (settings.fanMode == MODE_AUTO && !degradedMode) {
+      setFan(heaterState || coolerState || humidifierState);
+    }
+    return;
+  }
+
+  // ----- дальше идёт ваша СТАРАЯ логика (оставляем как есть) -----
+  if (on == heaterState) return;
+
+  // Новое: если просим ВКЛ нагрев — и уже включён охладитель, выключим охладитель и выйдем.
+  if (on && coolerState && currentScreen != SCREEN_HW_TEST) {
+    setCooler(false);
+    return;  // нагрев включится следующей итерацией, после взаимной блокировки
+  }
+
+
+  // ИСПРАВЛЕНО: при деградации допускаем немедленное выключение, игнорируя мин. времена
+  if (!on && degradedMode && currentScreen != SCREEN_HW_TEST) {
+    digitalWrite(HEATER_PIN, HIGH);
+    heaterState = false;
+    heaterOffTs = now;
+    heaterOnTs = 0;
+    if (settings.fanMode == MODE_AUTO) setFan(coolerState || humidifierState);  // подправим авто-вентилятор
+    uiNeedsUpdate = true;
+    return;
+  }
+
+  if (on && degradedMode && currentScreen != SCREEN_HW_TEST) return;
+
+  if (on && SAFE_MILLIS_DIFF(coolerOffTs, now) < HEATER_COOLER_LOCKOUT_TIME && currentScreen != SCREEN_HW_TEST) {
+    logEvent(F("Нагреватель не включен: блокировка после охладителя"));
+    return;
+  }
+  if (!on && SAFE_MILLIS_DIFF(heaterOnTs, now) < MIN_HEATER_ON_TIME && currentScreen != SCREEN_HW_TEST) {
+    logEvent(F("Нагреватель не выключен: мин. время работы"));
+    return;
+  }
+  if (on && SAFE_MILLIS_DIFF(heaterOffTs, now) < HEATER_MIN_OFF_TIME && currentScreen != SCREEN_HW_TEST) {
+    logEvent(F("Нагреватель не включен: мин. время выключения"));
+    return;
+  }
+
+  digitalWrite(HEATER_PIN, on ? LOW : HIGH);
+  heaterState = on;
+  uiNeedsUpdate = true;
+  if (on) heaterOnTs = now;
+  else {
+    heaterOffTs = now;
+    heaterOnTs = 0;
+  }
+
+  if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+    setFan(heaterState || coolerState || humidifierState);
+  }
+}
+
+void setCooler(bool on, bool force) {
+  unsigned long now = millis();
+  static unsigned long lastCoolerBlockLog = 0;
+  const unsigned long COOLER_BLOCK_LOG_INTERVAL = 60000UL;
+
+  // Если авария компрессора активна — не включаем его повторно автоматически
+  if (on && coolerStuckAlarmActive && currentScreen != SCREEN_HW_TEST) {
+    return;
+  }
+
+  // ВАРИАНТ 2: в штатном PID/авто-режиме компрессор НЕ должен обходить паузу.
+  // Поэтому даже если кто-то вызовет force=true — мягко игнорируем, кроме реально аварийной температуры.
+  if (force) {
+    float ct = currentTemp + settings.tempBias;
+    bool isEmergency = (ct > EMERGENCY_TEMP_MAX) || (ct < EMERGENCY_TEMP_MIN);
+    if (!isEmergency) {
+      force = false;
+    }
+  }
+
+  const bool pidHeatMode =
+    settings.pidEnabled && settings.heaterMode == MODE_AUTO && !dryingModeActive && !degradedMode && currentScreen != SCREEN_HW_TEST && atState != AT_RUNNING;
+
+  // --- РЕЖИМ СУШКИ ---
+  // В сушке: нагрев+охлаждение одновременно разрешены, но компрессор всё равно бережём.
+  if (dryingModeActive && currentScreen != SCREEN_HW_TEST) {
+    if (!on && SAFE_MILLIS_DIFF(coolerOnTs, now) < MIN_COOLER_ON_TIME) return;
+
+    // В сушке НЕ обходить COOLER_MIN_OFF_TIME даже при force
+    if (on && SAFE_MILLIS_DIFF(coolerOffTs, now) < COOLER_MIN_OFF_TIME) {
+      if (SAFE_MILLIS_DIFF(lastCoolerBlockLog, now) >= COOLER_BLOCK_LOG_INTERVAL) {
+        logEvent(F("Охладитель (сушка): не включен — мин. время выключения"));
+        lastCoolerBlockLog = now;
+      }
+      return;
+    }
+
+    if (on == coolerState) return;
+
+    float sp = settings.targetTemp;
+    if (program.active && program.currentStage < program.stageCount) sp = program.stages[program.currentStage].targetTemp;
+    temperatureSetpointOnCoolerStart = sp;
+    temperatureOnCoolerStart = currentTemp;
+    coolerStuckAlarmActive = false;
+
+    digitalWrite(COOLER_PIN, on ? LOW : HIGH);
+    coolerState = on;
+    uiNeedsUpdate = true;
+
+    if (on) {
+      coolerOnTs = now;
+    } else {
+      coolerOffTs = now;
+      coolerOnTs = 0;
+    }
+
+    if (settings.fanMode == MODE_AUTO && !degradedMode) {
+      setFan(heaterState || coolerState || humidifierState);
+    }
+    return;
+  }
+
+  // --- ВКЛЮЧЕНИЕ ---
+  if (on) {
+    if (coolerState || (degradedMode && currentScreen != SCREEN_HW_TEST)) return;
+
+    // Пауза после выключения — обходить можно ТОЛЬКО в реальной аварии (см. выше).
+    if (!force && SAFE_MILLIS_DIFF(coolerOffTs, now) < COOLER_MIN_OFF_TIME && currentScreen != SCREEN_HW_TEST) {
+      if (SAFE_MILLIS_DIFF(lastCoolerBlockLog, now) >= COOLER_BLOCK_LOG_INTERVAL) {
+        logEvent(pidHeatMode ? F("Охладитель (PID): не включен — мин. время выключения")
+                             : F("Охладитель не включен: мин. время выключения"));
+        lastCoolerBlockLog = now;
+      }
+      return;
+    }
+
+    // В НЕ-PID режиме: блокировка с нагревом сохраняется
+    if (!pidHeatMode) {
+      if (heaterState && currentScreen != SCREEN_HW_TEST) {
+        setHeater(false);
+        return;
+      }
+      if (!force && SAFE_MILLIS_DIFF(heaterOffTs, now) < HEATER_COOLER_LOCKOUT_TIME && currentScreen != SCREEN_HW_TEST) {
+        logEvent(F("Охладитель не включен: блокировка после нагревателя"));
+        return;
+      }
+    }
+
+    digitalWrite(COOLER_PIN, LOW);
+    coolerState = true;
+    coolerOnTs = now;
+    temperatureOnCoolerStart = currentTemp;
+
+    float sp = settings.targetTemp;
+    if (program.active && program.currentStage < program.stageCount) sp = program.stages[program.currentStage].targetTemp;
+    temperatureSetpointOnCoolerStart = sp;
+
+    coolerStuckAlarmActive = false;
+    uiNeedsUpdate = true;
+
+    if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+      setFan(heaterState || coolerState || humidifierState);
+    }
+    return;
+  }
+
+  // --- ВЫКЛЮЧЕНИЕ ---
+  if (degradedMode && currentScreen != SCREEN_HW_TEST) {
+    digitalWrite(COOLER_PIN, HIGH);
+    coolerState = false;
+    coolerOffTs = now;
+    coolerOnTs = 0;
+    uiNeedsUpdate = true;
+    if (settings.fanMode == MODE_AUTO) setFan(heaterState || humidifierState);
+    return;
+  }
+
+  if (!coolerState) return;
+
+  if (!force && SAFE_MILLIS_DIFF(coolerOnTs, now) < MIN_COOLER_ON_TIME && currentScreen != SCREEN_HW_TEST) {
+    logEvent(F("Охладитель не выключен: мин. время работы"));
+    return;
+  }
+
+  digitalWrite(COOLER_PIN, HIGH);
+  coolerState = false;
+  coolerOffTs = now;
+  coolerOnTs = 0;
+  uiNeedsUpdate = true;
+
+  if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+    setFan(heaterState || coolerState || humidifierState);
+  }
+}
+
+
+
+
+
+void setHumidifier(bool on) {
+  if (on == humidifierState) return;
+  unsigned long now = millis();
+
+  // ИСПРАВЛЕНО: при деградации допускаем немедленное выключение, игнорируя мин. времени
+  if (!on && degradedMode && currentScreen != SCREEN_HW_TEST) {
+    digitalWrite(HUMIDIFIER_PIN, HIGH);
+    humidifierState = false;
+    humidifierOffTs = now;
+    humidifierOnTs = 0;
+    if (settings.fanMode == MODE_AUTO) setFan(heaterState || coolerState);
+    uiNeedsUpdate = true;
+    return;
+  }
+
+  if (on && degradedMode && currentScreen != SCREEN_HW_TEST) return;
+
+  if (!on && SAFE_MILLIS_DIFF(humidifierOnTs, now) < MIN_HUMIDIFIER_ON_TIME && currentScreen != SCREEN_HW_TEST) {
+    logEvent(F("Увлажнитель не выключен: минимальное время работы не истекло"));
+    return;
+  }
+  if (on && SAFE_MILLIS_DIFF(humidifierOffTs, now) < HUMIDIFIER_MIN_OFF_TIME && currentScreen != SCREEN_HW_TEST) {
+    logEvent(F("Увлажнитель не включен: минимальное время выключения не истекло"));
+    return;
+  }
+  digitalWrite(HUMIDIFIER_PIN, on ? LOW : HIGH);
+  humidifierState = on;
+  if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+    setFan(heaterState || coolerState || humidifierState);
+  }
+  uiNeedsUpdate = true;
+  if (on) {
+    humidifierOnTs = now;
+    humidifierStartTime = now;
+    humidityOnHumidifierStart = currentHum;
+  } else {
+    humidifierOffTs = now;
+    humidifierOnTs = 0;
+  }
+}
+// ======================================================================
+//                     РЕЖИМ "УМНОЙ СУШКИ"
+// ======================================================================
+
+// Запуск режима сушки
+void startDryingMode() {
+  if (dryingModeActive) return;
+
+  dryingModeActive = true;
+  dryingModeStart = millis();
+
+  // === ВАЖНО: сброс PID/SSR перед сушкой, чтобы не "унаследовать" нагрев ===
+  heaterDemandPct = 0.0f;
+  pidOutput = 0.0f;
+  pidIntegral = 0.0f;
+  pidLastError = 0.0f;
+  pidWindowStart = millis();
+  setHeaterRaw(false);  // чтобы гарантированно выключить SSR прямо сейчас
+
+  dryingCoolerRequestMs = dryingModeStart;
+  dryingLastCoolerTryMs = 0;
+
+  logEvent(F("Режим сушки: старт"));
+}
+void stopDryingMode() {
+  if (!dryingModeActive) return;
+
+  dryingModeActive = false;
+
+  // Сброс служебных таймеров/меток, чтобы следующий старт был "чистый"
+  dryingModeStart = 0;
+  dryingCoolerRequestMs = 0;
+  dryingLastCoolerTryMs = 0;
+
+  // ВАЖНО: сбросить demand нагрева, чтобы SSR окно не продолжало включать нагрев
+  heaterDemandPct = 0.0f;
+  pidOutput = 0.0f;
+  pidIntegral = 0.0f;
+  pidLastError = 0.0f;
+  pidWindowStart = millis();
+
+  // Безопасно выключаем исполнительные, которые форсировались сушкой
+  // (увлажнитель в сушке и так выключается, но оставим явно)
+  setHeaterRaw(false);  // жёстко выключить SSR сразу
+  setCooler(false);
+  setHumidifier(false);
+
+  // Вентилятор: возвращаемся к нормальной логике AUTO, иначе оставим как есть
+  if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+    setFan(heaterState || coolerState || humidifierState);
+  }
+
+  logEvent(F("Режим сушки: стоп"));
+  uiNeedsUpdate = true;
+}
+
+
+
+
+void controlDrying(const DateTime& now_dt) {
+  (void)now_dt;
+
+  // Защита от невалидных показаний датчиков
+  if (isnan(currentTemp) || isnan(currentHum)) {
+    logEvent(F("controlDrying: датчики не готовы, пропуск"));
+    return;
+  }
+
+  // Защита компрессора от перегрев�� в режиме сушки
+  if (coolerState && coolerOnTs != 0) {
+    unsigned long now = millis();
+    if (SAFE_MILLIS_DIFF(coolerOnTs, now) > MAX_COOLER_RUNTIME) {
+      logEvent(F("Режим сушки: компрессор работал слишком долго.  Принудительная остановка сушки. "));
+      stopDryingMode();
+      return;
+    }
+  }
+
+  // Уставки:  из программы или общих настроек
+  float tempSet = settings.targetTemp;
+  float humSet = settings.targetHum;
+
+  if (program.active && program.currentStage < program.stageCount) {
+    tempSet = program.stages[program.currentStage].targetTemp;
+    humSet = program.stages[program.currentStage].targetHum;
+  }
+
+  const float heatH = settings.tempHeatHysteresis;
+  const float coolH = settings.tempCoolHysteresis;
+  const float humH = settings.humHysteresis;
+
+  const float t = currentTemp + settings.tempBias;
+  const float h = currentHum + settings.humBias;
+
+  const unsigned long now = millis();
+
+  // 0) В сушке вентилятор должен всегда работать
+  if (!degradedMode && currentScreen != SCREEN_HW_TEST) {
+    setFan(true);
+  }
+
+  // 0. 1) В сушке увлажнитель всегда выключен
+  setHumidifier(false);
+
+  // 1) Таймаут сушки - максимум 30 минут
+  if (SAFE_MILLIS_DIFF(dryingModeStart, now) > MAX_DRYING_DURATION) {
+    logEvent(F("Режим сушки: остановлен по таймеру (30 мин)"));
+    stopDryingMode();
+    return;
+  }
+
+  // 2) КРИТИЧЕСКИ ВАЖНО для SSR: компрессор должен запуститься первым
+  if (!coolerState) {
+    if (dryingCoolerRequestMs == 0) {
+      dryingCoolerRequestMs = now;
+    }
+
+    // Периодически пытаемся включить компрессор (с учетом защиты COOLER_MIN_OFF_TIME)
+    if (dryingLastCoolerTryMs == 0 || SAFE_MILLIS_DIFF(dryingLastCoolerTryMs, now) >= DRYING_COOLER_TRY_PERIOD_MS) {
+      dryingLastCoolerTryMs = now;
+
+      // ВАЖНО: для компрессора 110л нужна защита от частого включения
+      // Проверяем, прошло ли 5 минут с момента выключения
+      if (SAFE_MILLIS_DIFF(coolerOffTs, now) >= COOLER_MIN_OFF_TIME) {
+        setCooler(true);
+      }
+    }
+
+    // КРИТИЧНО для SSR: пока компрессор не запущен - НЕ включаем нагрев!
+    heaterDemandPct = 0.0f;  // нагрев запрещён пока не запущен компрессор
+    setHeaterRaw(false);     // можно оставить как "жёсткое выключение" на этот период
+    // Если слишком долго не удаётся запустить компрессор - выходим
+    if (SAFE_MILLIS_DIFF(dryingCoolerRequestMs, now) > DRYING_MAX_WAIT_COOLER_MS) {
+      logEvent(F("Режим сушки: компрессор не стартует (lockout). Выход из сушки."));
+      stopDryingMode();
+    }
+    return;
+  }
+
+  // 3) Компрессор включен - можем управлять температурой
+
+  // Держим компрессор включённым (он осушает)
+  setCooler(true);
+
+  // 4) Управление температурой с учетом SSR и тепловентилятора:
+  // 4) Точное удержание температуры в сушке (SSR, time-proportional)
+  // Влажность НЕ управляет нагревом. Её делает компрессор.
+
+  const float err = tempSet - t;  // + => холодно, надо греть
+  const float DB = 0.15f;         // мёртвая зона ±0.15°C (можно 0.1..0.3)
+  const float KpDry = 30.0f;      // % на 1°C ошибки (подбор 20..50)
+
+  // По умолчанию не греем
+  heaterDemandPct = 0.0f;
+
+  if (err > DB) {
+    // Чем холоднее относительно уставки, тем больше % нагрева
+    heaterDemandPct = err * KpDry;
+
+    // Ограничение
+    if (heaterDemandPct > 100.0f) heaterDemandPct = 100.0f;
+  } else if (err < -DB) {
+    // Выше уставки: 0%
+    heaterDemandPct = 0.0f;
+  } else {
+    // В пределах мёртвой зоны:
+    // Можно держать 0 для "чёткой" стабилизации,
+    // либо оставить предыдущий demand (но тогда нужен статик).
+    heaterDemandPct = 0.0f;
+  }
+
+
+
+  // 5) Условие выхода из сушки - влажность достигла целевой
+  if (h <= humSet) {
+    logEvent(F("Режим сушки: влажность достигла цели"));
+    stopDryingMode();
+    return;
+  }
+
+  // 6) Защита по предельной температуре
+  const float SAFETY_MARGIN = 1.0f;
+  if (t > EMERGENCY_TEMP_MAX - SAFETY_MARGIN) {
+    logEvent(F("Режим сушки: остановлен - превышена максимальная температура"));
+    stopDryingMode();
+    return;
+  }
+
+  if (t < EMERGENCY_TEMP_MIN + SAFETY_MARGIN) {
+    logEvent(F("Режим сушки:  остановлен - температура ниже минимума"));
+    stopDryingMode();
+    return;
+  }
+
+  // 7) Дополнительная защита для SSR от перегрева
+  // Если нагрев работает непрерывно более 10 минут при высокой температуре
+  static unsigned long continuousHeaterStart = 0;
+  const unsigned long MAX_CONTINUOUS_HEATER_TIME = 600000UL;  // 10 минут
+
+
+  if (heaterDemandPct > 1.0f) {
+    if (continuousHeaterStart == 0) {
+      continuousHeaterStart = now;
+    }
+
+    // Если температура выше 20°C и нагрев работает долго - пауза
+    if (t > 20.0f && SAFE_MILLIS_DIFF(continuousHeaterStart, now) > MAX_CONTINUOUS_HEATER_TIME) {
+      heaterDemandPct = 0.0f;
+      setHeaterRaw(false);
+      continuousHeaterStart = 0;
+      logEvent(F("Режим сушки:  принудительная пауза нагрева (защита SSR)"));
+
+      // Ждем 1 минуту перед повторным включением
+      static unsigned long heaterPauseStart = 0;
+      if (heaterPauseStart == 0) {
+        heaterPauseStart = now;
+      }
+
+      if (SAFE_MILLIS_DIFF(heaterPauseStart, now) > 60000UL) {
+        heaterPauseStart = 0;  // Сброс паузы
+      } else {
+        return;  // Не даем включить нагрев во время паузы
+      }
+    }
+  } else {
+    continuousHeaterStart = 0;
+  }
+
+  // 8) Логирование состояния каждые 30 секунд
+  static unsigned long lastDryingLog = 0;
+  if (SAFE_MILLIS_DIFF(lastDryingLog, now) > 30000UL) {
+    lastDryingLog = now;
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "Сушка: T=%.1f°C (цель %.1f), H=%.1f%% (цель %.1f), Нагрев=%d, Компрессор=%d",
+             t, tempSet, h, humSet, heaterState ? 1 : 0, coolerState ? 1 : 0);
+    logEvent(buf);
+  }
+}
+
+
+
+void setFan(bool on) {
+  if (on == fanState) return;
+  if (on && degradedMode && currentScreen != SCREEN_HW_TEST) {
+    logEvent(F("Вентилятор не включен: система в деградированном режиме"));
+    return;
+  }
+  digitalWrite(FAN_PIN, on ? LOW : HIGH);
+  fanState = on;
+  uiNeedsUpdate = true;
+  if (on) {
+    if (rtcOk) fanLastRunUnix = (uint32_t)(rtc.now().unixtime());  // секунды
+    else fanLastRunMs = millis();                                  // миллисекунды
+  }
+}
+
+
+void beepClick() {
+  if (!settings.beeperEnabled) return;
+  digitalWrite(BUZZER_PIN, LOW);
+  delayMicroseconds(500);
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void controlHumidity(const DateTime& now_dt) {
+  // НОВОЕ: Защита от невалидных показаний датчиков
+  if (isnan(currentTemp) || isnan(currentHum)) {
+    logEvent(F("controlHumidity: датчики не готовы, пропуск"));
+    return;
+  }
+
+  if (lowWaterAlarmActive) {
+    setHumidifier(false);
+    return;
+  }
+  float sp = settings.targetHum;
+
+  // ЗАМЕНА: безопасный доступ к stage
+  if (program.active && program.currentStage < program.stageCount) {
+    sp = program.stages[program.currentStage].targetHum;
+  }
+
+  float h = settings.humHysteresis;
+  sp = constrain(sp, 0, 100);
+  float calibratedHum = currentHum + settings.humBias;
+
+  if (settings.humidMode == MODE_OFF) {
+    setHumidifier(false);
+  } else if (settings.humidMode == MODE_ON) {
+    setHumidifier(true);
+  } else {
+    if (calibratedHum < sp - h * 0.5f) setHumidifier(true);
+    if (calibratedHum > sp + h * 0.5f) setHumidifier(false);
+  }
+  controlManualFan(now_dt);
+}
+
+
+void controlManualFan(const DateTime& now_dt) {
+  uint16_t intervalHours = settings.manualFanIntervalHours;
+  uint16_t durationMinutes = settings.manualFanDurationMinutes;
+
+  // ЗАМЕНА: безопасный доступ к stage
+  if (program.active && settings.fanMode == MODE_TIMED &&
+      program.currentStage < program.stageCount) {
+    intervalHours = program.stages[program.currentStage].fanInterval;
+    durationMinutes = program.stages[program.currentStage].fanDuration;
+  }
+
+  // Режимы ВКЛ/ВЫКЛ
+  if (settings.fanMode == MODE_ON) {
+    if (!fanState) {
+      setFan(true);
+      logEvent(F("Вентилятор включен: режим ВКЛ"));
+    }
+    return;
+  }
+  if (settings.fanMode == MODE_OFF) {
+    if (fanState) {
+      setFan(false);
+      logEvent(F("Вентилятор выключен: режим ВЫКЛ"));
+    }
+    return;
+  }
+  if (settings.fanMode != MODE_TIMED) return;
+// НОВОЕ: защита от нулевых значений
+  if (intervalHours == 0 || durationMinutes == 0) {
+    if (fanState) setFan(false);
+    return;
+  }
+
+
+  
+  // --- RTC ветка (секунды UNIX) ---
+  if (rtcOk) {
+    const uint32_t nowU = (uint32_t)now_dt.unixtime();
+    const uint32_t intervalSec = (uint32_t)intervalHours * 3600UL;
+    const uint32_t durationSec = (uint32_t)durationMinutes * 60UL;
+
+    // Инициализация базы, если пусто или явно неверно
+    if (fanLastRunUnix == 0) {
+      fanLastRunUnix = nowU;
+    }
+
+    if (fanState) {
+      if ((uint32_t)(nowU - fanLastRunUnix) >= durationSec) {
+        setFan(false);
+        logEvent(F("Вентилятор выключен по таймеру (RTC)"));
+      }
+    } else {
+      if ((uint32_t)(nowU - fanLastRunUnix) >= intervalSec) {
+        setFan(true);
+        fanLastRunUnix = nowU;  // момент включения
+        logEvent(F("Вентилятор включен по таймеру (RTC)"));
+      }
+    }
+    return;
+  }
+
+  // --- Fallback без RTC (millis) ---
+  const unsigned long nowMs = millis();
+  const unsigned long intervalMs = (unsigned long)intervalHours * MILLIS_PER_HOUR;
+  const unsigned long durationMs = (unsigned long)durationMinutes * MILLIS_PER_MINUTE;
+
+  // Инициализация/защита от переполнения millis()
+  if (fanLastRunMs == 0 || fanLastRunMs > nowMs) {
+    fanLastRunMs = nowMs;
+  }
+
+  if (fanState) {
+    if (SAFE_MILLIS_DIFF(fanLastRunMs, nowMs) >= durationMs) {
+      setFan(false);
+      logEvent(F("Вентилятор выключен по таймеру (fallback)"));
+    }
+  } else {
+    if (SAFE_MILLIS_DIFF(fanLastRunMs, nowMs) >= intervalMs) {
+      setFan(true);
+      fanLastRunMs = nowMs;  // момент включения
+      logEvent(F("Вентилятор включен по таймеру (fallback)"));
+    }
+  }
+}
+
+
+
+void controlTemperature(const DateTime& now_dt) {
+  (void)now_dt;
+
+
+  // НОВОЕ: Защита от невалидных показаний датчиков
+  if (isnan(currentTemp) || isnan(currentHum)) {
+    logEvent(F("controlTemperature: датчики не готовы, пропуск"));
+    return;
+  }
+
+
+  // Автотюнинг: нагрев дергается там, тут только безопасно выключаем охлаждение.
+  if (atState == AT_RUNNING) {
+    pidOutput = 0.0f;
+    pidIntegral = 0.0f;
+    pidLastError = 0.0f;
+    pidWindowStart = millis();
+    setHeaterRaw(false);
+    setCooler(false);
+    return;
+  }
+
+  float sp = settings.targetTemp;
+  if (program.active && program.currentStage < program.stageCount) {
+    sp = program.stages[program.currentStage].targetTemp;
+  }
+
+  float heatH = settings.tempHeatHysteresis;
+  float coolH = settings.tempCoolHysteresis;
+  float calibratedTemp = currentTemp + settings.tempBias;
+
+  // PID "логически активен" (имеем право управлять нагревом PID'ом)
+  const bool pidActive =
+    settings.pidEnabled && settings.heaterMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST && !dryingModeActive;
+
+  // --- Anti-windup: если компрессор включен, PID должен быть сброшен ---
+  // (дублируем защиту на уровне "медленного цикла", это полезно)
+  if (pidActive && coolerState) {
+    pidOutput = 0.0f;
+    pidIntegral = 0.0f;
+    pidLastError = 0.0f;
+    pidWindowStart = millis();
+    setHeaterRaw(false);
+  }
+
+  // --- 1) Нагрев ---
+  // В PID режиме здесь НИЧЕГО не делаем с нагревом (им управляет stepPidControl).
+  // В не-PID — старая логика.
+  if (!pidActive) {
+    if (settings.heaterMode == MODE_OFF) {
+      setHeater(false);
+    } else if (settings.heaterMode == MODE_ON) {
+      setHeater(true);
+    } else {  // MODE_AUTO без PID
+      if (calibratedTemp < sp - heatH * 0.5f) {
+        if (!coolerState || (SAFE_MILLIS_DIFF(coolerOnTs, millis()) >= MIN_COOLER_ON_TIME)) {
+          setHeater(true);
+        }
+      }
+      if (calibratedTemp > sp + heatH * 0.5f) setHeater(false);
+    }
+  } else {
+    // PID включён: если выше верхней границы — дополнительная страховка (чтобы не греть вообще)
+    if (calibratedTemp > sp + heatH * 0.5f) {
+      pidOutput = 0.0f;
+      pidIntegral = 0.0f;
+      pidLastError = 0.0f;
+      pidWindowStart = millis();
+      setHeaterRaw(false);
+    }
+  }
+
+  // --- 2) Охлаждение ---
+  if (settings.coolerMode == MODE_OFF) {
+    setCooler(false);
+  } else if (settings.coolerMode == MODE_ON) {
+    // Ручной ON: пользователь явно требует холод => гасим PID нагрев (anti-windup)
+    if (pidActive) {
+      pidOutput = 0.0f;
+      pidIntegral = 0.0f;
+      pidLastError = 0.0f;
+      pidWindowStart = millis();
+      setHeaterRaw(false);
+    }
+    setCooler(true);  // без force
+  } else {            // MODE_AUTO
+    if (!coolerStuckAlarmActive) {
+
+      // ВАРИАНТ A: пока PID реально греет > X%, компрессор НЕ включаем.
+      const float PID_HEAT_ACTIVE_THRESHOLD_PCT = 8.0f;  // подберите 5..15%
+
+      if (calibratedTemp > sp + coolH * 0.5f) {
+        // Запрет включения компрессора, если PID активно греет
+        if (!(pidActive && (pidOutput > PID_HEAT_ACTIVE_THRESHOLD_PCT))) {
+          setCooler(true);
+        }
+      }
+
+      if (calibratedTemp < sp - coolH * 0.5f) {
+        setCooler(false);
+      }
+
+      // Если cooler уже включился (по другим причинам) — нагрев PID должен быть 0 (anti-windup)
+      if (pidActive && coolerState) {
+        pidOutput = 0.0f;
+        pidIntegral = 0.0f;
+        pidLastError = 0.0f;
+        pidWindowStart = millis();
+        setHeaterRaw(false);
+      }
+    } else {
+      setCooler(false);
+    }
+  }
+
+  // --- 3) Разруливание “оба включены” ---
+  // В PID режиме НЕ используем setHeater(), чтобы не конфликтовать с SSR-окном.
+  if (!dryingModeActive) {
+    if (!pidActive) {
+      if (heaterState && coolerState) {
+        if (calibratedTemp >= sp) setHeater(false);
+        else setCooler(false);
+      }
+    } else {
+      // PID режим: если компрессор вдруг включен, нагрев уже сброшен выше.
+      // Ничего не делаем (не трогаем setHeater()).
+    }
+  }
+
+  // --- 4) Автовентилятор ---
+  if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+    setFan(heaterState || coolerState || humidifierState);
+  }
+}
+
+
+
+
+void startPidAutotune() {
+  if (degradedMode || currentScreen == SCREEN_HW_TEST) return;
+
+  atState = AT_RUNNING;
+  atStartMs = millis();
+  atProgress = 0;
+
+  atSetpoint = 15.0f;
+  atNoiseBand = 0.3f;
+
+  // Начинаем с нагрева
+  atRelayHigh = true;
+
+  // Сброс измерений пиков
+  atHigh = -1000.0f;
+  atLow = 1000.0f;
+  atHaveHigh = false;
+  atHaveLow = false;
+
+  atPrevT = currentTemp + settings.tempBias;
+  atTrend = 0;
+
+  // Пики/циклы
+  atPeaks = 0;
+  atAmpSum = 0.0f;
+  atCycles = 0;
+
+  // Период HIGH->HIGH
+  atPrevPeakMs = 0;
+  atLastPeakMs = 0;
+
+  atNextUiUpdateMs = millis();
+
+  setCooler(false);
+  setHeaterRaw(true);
+
+#if DEBUG_SERIAL
+  Serial.println(F("[AT] start"));
+#endif
+
+  uiNeedsUpdate = true;
+}
+
+
+
+
+
+void abortPidAutotune() {
+  // Безопасно гасим всё, даже если не были в RUNNING
+  atState = AT_ABORT;
+  atProgress = 0;
+
+  setHeaterRaw(false);
+  setCooler(false);
+
+  pidOutput = 0.0f;
+  pidIntegral = 0.0f;
+  pidLastError = 0.0f;
+  pidWindowStart = millis();
+  heaterDemandPct = 0.0f;
+
+  // Синхронизируем таймеры, чтобы on/off-логика не застряла
+  unsigned long now = millis();
+  heaterOffTs = now;
+  heaterOnTs = 0;
+
+  uiNeedsUpdate = true;
+  forceRedraw = true;
+
+#if DEBUG_SERIAL
+  Serial.println(F("[AT] abort"));
+#endif
+}
+
+void stepPidAutotune(unsigned long nowMs) {
+  if (atState != AT_RUNNING) return;
+  if (degradedMode || currentScreen == SCREEN_HW_TEST) {
+    abortPidAutotune();
+    return;
+  }
+
+  // Лимиты
+  const unsigned long AT_TIMEOUT = 90UL * 60UL * 1000UL;  // 90 минут для медленной системы 110л
+  const unsigned long NO_PEAK_ABORT_MS = 10UL * 60UL * 1000UL;
+  const float MAX_BAND = 1.0f;  // не расширяем бесконечно
+
+  // Таймаут процесса
+  unsigned long elapsed = SAFE_MILLIS_DIFF(atStartMs, nowMs);
+  if (elapsed > AT_TIMEOUT) {
+    logEvent(F("PID autotune aborted: timeout"));
+    abortPidAutotune();
+    return;
+  }
+
+  // Авторасширение band + ограничение
+  if (elapsed > 8UL * 60UL * 1000UL && atCycles < 1 && atNoiseBand < 0.4f) atNoiseBand = 0.4f;
+  if (elapsed > 12UL * 60UL * 1000UL && atCycles < 2 && atNoiseBand < 0.5f) atNoiseBand = 0.5f;
+  if (atNoiseBand > MAX_BAND) atNoiseBand = MAX_BAND;
+
+  float t = currentTemp + settings.tempBias;
+
+  // Оверхит
+  if (t >= AUTOTUNE_MAX_TEMP) {
+    logEvent(F("PID autotune aborted: temperature limit reached"));
+    abortPidAutotune();
+    return;
+  }
+
+  // Нет пиков слишком долго — прерываем
+  if ((atLastPeakMs == 0 && elapsed > NO_PEAK_ABORT_MS) || (atLastPeakMs != 0 && SAFE_MILLIS_DIFF(atLastPeakMs, nowMs) > NO_PEAK_ABORT_MS)) {
+    logEvent(F("PID autotune aborted: no peaks detected"));
+    abortPidAutotune();
+    return;
+  }
+
+  // Relay
+  if (t < atSetpoint - atNoiseBand) atRelayHigh = true;
+  else if (t > atSetpoint + atNoiseBand) atRelayHigh = false;
+  setHeaterRaw(atRelayHigh);
+
+  // Тренд
+  float dT = t - atPrevT;
+  int newTrend = 0;
+  if (dT > 0.01f) newTrend = +1;
+  else if (dT < -0.01f) newTrend = -1;
+
+  if (atTrend == 0) {
+    atTrend = newTrend;
+  } else if (newTrend != 0 && newTrend != atTrend) {
+    if (atTrend == +1 && newTrend == -1) {
+      // HIGH
+      atHigh = atPrevT;
+      atHaveHigh = true;
+      atPrevPeakMs = atLastPeakMs;
+      atLastPeakMs = nowMs;
+    } else if (atTrend == -1 && newTrend == +1) {
+      // LOW
+      atLow = atPrevT;
+      atHaveLow = true;
+    }
+    atTrend = newTrend;
+
+    // Когда есть пара High+Low — считаем амплитуду
+    if (atHaveHigh && atHaveLow) {
+      float a = (atHigh - atLow) * 0.5f;
+      if (a > 0.05f) {
+        atAmpSum += a;
+        atCycles++;
+      }
+      atHaveHigh = false;
+      atHaveLow = false;
+    }
+  }
+  atPrevT = t;
+
+  const uint8_t TARGET_CYCLES = 6;
+  if (atCycles >= TARGET_CYCLES && atPrevPeakMs != 0 && atLastPeakMs > atPrevPeakMs) {
+    unsigned long d = SAFE_MILLIS_DIFF(atPrevPeakMs, atLastPeakMs);
+    if (d < 10000UL) {
+      logEvent(F("PID autotune: period too short, continuing"));
+      // сбрасываем один цикл и ждём следующего пика
+      atCycles = TARGET_CYCLES - 1;
+    } else {
+      float Pu = ((float)d) / 1000.0f;
+      float a = atAmpSum / (float)atCycles;
+
+      const float dRelay = 1.0f;
+      float Ku = (4.0f * dRelay) / (PI * a);
+
+      float Kp = 0.6f * Ku;
+      float Ti = 0.5f * Pu;
+      float Td = 0.125f * Pu;
+
+      float Ki = (Ti > 0.01f) ? (Kp / Ti) : 0.0f;
+      float Kd = Kp * Td;
+
+      if (!isfinite(Kp) || !isfinite(Ki) || !isfinite(Kd) || Kp <= 0.0f || Kp > 100.0f || Ki < 0.0f || Ki > 10.0f || Kd < 0.0f || Kd > 100.0f) {
+        logEvent(F("PID autotune failed: invalid gains"));
+        abortPidAutotune();
+        return;
+      }
+
+      settings.pidKp = Kp;
+      settings.pidKi = Ki;
+      settings.pidKd = Kd;
+      settingsDirty = true;
+      saveSettings();
+
+      setHeaterRaw(false);
+      pidOutput = 0.0f;
+      pidIntegral = 0.0f;
+      pidLastError = 0.0f;
+      heaterOffTs = millis();
+      heaterOnTs = 0;
+
+      atProgress = 100;
+      atState = AT_DONE;
+      uiNeedsUpdate = true;
+
+#if DEBUG_SERIAL
+      char buf[96];
+      snprintf(buf, sizeof(buf), "[AT] DONE Kp=%.3f Ki=%.3f Kd=%.3f Pu=%.1fs", Kp, Ki, Kd, Pu);
+      Serial.println(buf);
+#endif
+      return;
+    }
+  }
+
+  atProgress = (uint8_t)min(99, (int)((atCycles * 100) / TARGET_CYCLES));
+
+  if (SAFE_MILLIS_DIFF(atNextUiUpdateMs, nowMs) > 500UL) {
+    atNextUiUpdateMs = nowMs;
+    uiNeedsUpdate = true;
+  }
+}
+
+
+float computeHeaterPid(float setpoint, float current, float dtSec) {
+  float error = setpoint - current;
+
+  // P-составляющая
+  float pTerm = settings.pidKp * error;
+
+  // I-составляющая с anti-windup
+  float newIntegral = pidIntegral + error * dtSec;
+
+  // D-составляющая
+  float dTerm = 0.0f;
+  if (dtSec > 0.001f) {
+    dTerm = settings.pidKd * (error - pidLastError) / dtSec;
+  }
+
+  // Предварительный расчёт выхода
+  float rawOut = pTerm + settings.pidKi * newIntegral + dTerm;
+
+  // Anti-windup: не накапливаем интегратор если выход насыщен
+  if (rawOut > 100.0f) {
+    // Насыщение сверху - откатываем интегратор
+    if (error > 0) {
+      // Не увеличиваем интегратор
+    } else {
+      pidIntegral = newIntegral;
+    }
+  } else if (rawOut < 0.0f) {
+    // Насыщение снизу - откатываем интегратор
+    if (error < 0) {
+      // Не уменьшаем интегратор
+    } else {
+      pidIntegral = newIntegral;
+    }
+  } else {
+    // Нормальный режим - обновляем интегратор
+    pidIntegral = newIntegral;
+  }
+
+  // Жесткое ограничение интегратора
+  const float I_MAX = 50.0f / max(settings.pidKi, 0.001f);
+  if (pidIntegral > I_MAX) pidIntegral = I_MAX;
+  if (pidIntegral < -I_MAX) pidIntegral = -I_MAX;
+
+  pidLastError = error;
+
+  // Финальный рас  ет с ограниченным интегратором
+  float out = pTerm + settings.pidKi * pidIntegral + dTerm;
+
+  // Ограничение выхода 0-100%
+  if (out < 0.0f) out = 0.0f;
+  if (out > 100.0f) out = 100.0f;
+
+  pidOutput = out;
+  return out;
+}
+
+
+
+
+static inline void applyHeaterDemandWindow(unsigned long nowMs) {
+  // Приводим demand к 0..100
+  float out = heaterDemandPct;
+  if (!isfinite(out)) out = 0.0f;
+  if (out < 0.0f) out = 0.0f;
+  if (out > 100.0f) out = 100.0f;
+
+  // Чтобы не ломать существующий код, используем pidOutput как "внутреннюю переменную" окна.
+  // (Можно выделить отдельную переменную, но так меньше правок.)
+  pidOutput = out;
+
+  applyHeaterSsrWindow(nowMs);  // внутри вызовет setHeaterRaw(wantOn)
+}
+
+
+
+void applyHeaterSsrWindow(unsigned long nowMs) {
+  // SSR окно 1..10 сек
+  unsigned long window = settings.pidWindowMs;
+  if (window < 1000) window = 1000;
+  if (window > 10000) window = 10000;
+
+  // Перезапуск окна
+  if ((unsigned long)(nowMs - pidWindowStart) >= window) {
+    pidWindowStart = nowMs;
+  }
+
+  float out = pidOutput;
+  if (out < 0.0f) out = 0.0f;
+  if (out > 100.0f) out = 100.0f;
+
+  unsigned long onTime = (unsigned long)(out * (float)window / 100.0f);
+  bool wantOn = ((unsigned long)(nowMs - pidWindowStart) < onTime);
+
+  // В SSR/PID режиме управляй напрямую, без блокировок setHeater()
+  setHeaterRaw(wantOn);
+}
+
+void setPidEnabled(bool en) {
+  // Если выключаем PID во время autotune — прерываем
+  if (!en && atState == AT_RUNNING) {
+    abortPidAutotune();
+  }
+
+  settings.pidEnabled = en;
+
+  // Полный сброс PID состояния
+  pidIntegral = 0.0f;
+  pidLastError = 0.0f;
+  pidOutput = 0.0f;
+  pidWindowStart = millis();
+  heaterDemandPct = 0.0f;
+
+  settingsDirty = true;
+  saveSettings();
+
+  // Если PID выключили — гарантированно выключим нагрев
+  if (!settings.pidEnabled) {
+    setHeaterRaw(false);
+    // Синхронизируем таймеры для обычной логики
+    heaterOffTs = millis();
+    heaterOnTs = 0;
+  }
+
+  uiNeedsUpdate = true;
+
+#if DEBUG_SERIAL
+  Serial.print(F("PID "));
+  Serial.println(en ? F("enabled") : F("disabled"));
+#endif
+}
+
+
+
+
+
+
+void handlePidTouch(int x, int y) {
+  lastTouchTime = millis();
+
+  // BACK
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+
+    // ВАЖНО: если идёт autotune — обязательно остановить и выключить нагрев
+    if (atState == AT_RUNNING) {
+      abortPidAutotune();
+    }
+
+    // выход обратно на экран нагрева
+    currentScreen = SCREEN_HEATER;
+    forceRedraw = true;
+    drawHeaterSettingsScreen(true);
+    return;
+  }
+
+  // TOGGLE PID
+  if (inBtn(btnPidToggle, x, y)) {
+    beepClick();
+
+    // Если идёт автотюнинг — запрещаем переключение (либо можно abort)
+    if (atState == AT_RUNNING) return;
+
+    setPidEnabled(!settings.pidEnabled);
+    forceRedraw = true;
+    uiNeedsUpdate = true;
+    drawPidScreen(true);
+    return;
+  }
+
+  // AUTOTUNE
+  if (settings.pidEnabled && inBtn(btnPidAutotune, x, y)) {
+    beepClick();
+    if (atState != AT_RUNNING) {
+      startPidAutotune();
+      forceRedraw = true;
+      uiNeedsUpdate = true;
+      drawPidScreen(true);
+    }
+    return;
+  }
+
+  // ABORT
+  if (settings.pidEnabled && atState == AT_RUNNING && inBtn(btnPidAbort, x, y)) {
+    beepClick();
+    abortPidAutotune();
+    forceRedraw = true;
+    uiNeedsUpdate = true;
+    drawPidScreen(true);
+    return;
+  }
+}
+static void stepPidControl(unsigned long nowMs) {
+  // PID работает только для НАГРЕВА через SSR.
+  if (!settings.pidEnabled || settings.heaterMode != MODE_AUTO || dryingModeActive || degradedMode || currentScreen == SCREEN_HW_TEST || atState == AT_RUNNING) {
+    return;
+  }
+
+  // === Anti-windup / запрет нагрева при работе компрессора ===
+  // Вариант A: когда компрессор работает, нагрев PID должен быть 0 и интегратор сброшен.
+  if (coolerState) {
+    pidOutput = 0.0f;
+    heaterDemandPct = 0.0f;
+    pidIntegral = 0.0f;
+    pidLastError = 0.0f;
+    pidWindowStart = nowMs;
+    setHeaterRaw(false);
+    if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+      setFan(true);  // или setFan(coolerState || humidifierState);
+    }
+    return;
+  }
+
+  // Setpoint
+  float sp = settings.targetTemp;
+  if (program.active && program.currentStage < program.stageCount) {
+    sp = program.stages[program.currentStage].targetTemp;
+  }
+
+  // Current temp (калиброванная)
+  const float t = currentTemp + settings.tempBias;
+  const float heatH = settings.tempHeatHysteresis;
+
+  // === Жёсткий запрет нагрева выше верхней границы гистерезиса нагрева ===
+  // (защита от подогрева на перегреве и от накопления интегратора)
+  if (t > sp + heatH * 0.5f) {
+    pidOutput = 0.0f;
+    heaterDemandPct = 0.0f;
+    pidIntegral = 0.0f;
+    pidLastError = 0.0f;
+    pidWindowStart = nowMs;
+    setHeaterRaw(false);
+    return;
+  }
+
+  // === Тайминг расчёта PID математики ===
+  // Математику считаем редко (например раз в 1 сек), SSR-окно обслуживаем каждый loop.
+  static unsigned long lastPidCalcMs = 0;
+  const unsigned long PID_SAMPLE_TIME_MS = 1000UL;  // можно 500..1000 для камеры
+
+  if (lastPidCalcMs == 0) {
+    lastPidCalcMs = nowMs;  // инициализация
+  }
+
+  if (SAFE_MILLIS_DIFF(lastPidCalcMs, nowMs) >= PID_SAMPLE_TIME_MS) {
+    float dtSec = (float)SAFE_MILLIS_DIFF(lastPidCalcMs, nowMs) / 1000.0f;
+    lastPidCalcMs = nowMs;
+
+    // Защита от аномального dt (если вдруг был долгий лаг)
+    if (dtSec < 0.05f) dtSec = 0.05f;
+    if (dtSec > 10.0f) dtSec = 10.0f;
+
+    // Вычисляем PID (ваша существующая функция обновляет pidOutput)
+    computeHeaterPid(sp, t, dtSec);
+
+    // На всякий случай (если computeHeaterPid даст мусор из-за параметров)
+    if (!isfinite(pidOutput) || pidOutput < 0.0f) pidOutput = 0.0f;
+    if (pidOutput > 100.0f) pidOutput = 100.0f;
+  }
+
+  // === Управление SSR окном — каждый цикл ===
+  heaterDemandPct = pidOutput;  // unified demand for SSR
+
+  // === Авто-вентилятор ===
+  if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+    // Вентилятор — когда есть активность нагрева (pidOutput) или увлажнения
+    // coolerState здесь всегда false (мы вышли выше), так что не включаем от него
+    setFan((pidOutput > 0.1f) || humidifierState);
+  }
+}
+
+
+
+
+
+
+
+
+// ======================================================================
+//           ДАТЧИКИ, АЛАРМЫ, WATCHDOG, ДЕГРАДИРОВАННЫЙ РЕЖИМ
+// ======================================================================
+
+void readSensors() {
+  if (degradedMode) {
+    if (SAFE_MILLIS_DIFF(lastSensorRecoveryAttempt, millis()) < SENSOR_RECOVERY_INTERVAL) {
+      return;
+    }
+    logEvent(F("Попытка восстановления из деградированного режима..."));
+    lastSensorRecoveryAttempt = millis();
+  }
+
+  float t = sht31.readTemperature();  // °C
+  float h = sht31.readHumidity();     // %RH
+
+  bool tempOk = !isnan(t) && t >= -40.0 && t <= 90.0;
+  bool humOk = !isnan(h) && h >= 0.0 && h <= 100.0;
+
+  if (tempOk && humOk) {
+    if (degradedMode) {
+      sensorRecoveryCounter++;
+      if (sensorRecoveryCounter >= RECOVERY_SUCCESS_COUNT) {
+        exitDegradedMode();
+        sensorRecoveryCounter = 0;
+      }
+    } else {
+      sensorRecoveryCounter = 0;
+    }
+
+    sensorReadFailCount = 0;
+
+    // ДОБАВЛЕНО: сохраняем предыдущее значение ДО обновления/фильтра, для решения uiNeedsUpdate
+    float prevTemp = currentTemp;
+    float prevHum = currentHum;
+
+    if (isFirstSensorRead) {
+      currentTemp = t;
+      currentHum = h;
+      isFirstSensorRead = false;
+      uiNeedsUpdate = true;
+    } else {
+      // Аномальный скачок влажности (как было)
+      if (fabs(h - currentHum) > MAX_SENSOR_HUM_JUMP && !isnan(currentHum) && currentHum >= 0.0 && currentHum <= 100.0) {
+        char log_buffer[128];
+        char currentHumStr[16];
+        char hStr[16];
+        dtostrf(currentHum, 4, 1, currentHumStr);
+        dtostrf(h, 4, 1, hStr);
+        snprintf(log_buffer, sizeof(log_buffer),
+                 "АНОМАЛЬНЫЙ СКАЧОК: Влажность с %s до %s", currentHumStr, hStr);
+        logEvent(log_buffer);
+      }
+
+      // Экспоненциальное сглаживание (как было)
+      currentTemp = (0.7f * currentTemp) + (0.3f * t);
+      currentHum = (0.7f * currentHum) + (0.3f * h);
+
+      // ИСПРАВЛЕНО: критерий обновления UI считаем по изменению filtered значения относительно ПРЕДЫДУЩЕГО filtered
+      if (fabs(currentTemp - prevTemp) > 0.05f || fabs(currentHum - prevHum) > 0.1f) {
+        uiNeedsUpdate = true;
+      }
+    }
+  } else {
+    sensorReadFailCount++;
+    sensorRecoveryCounter = 0;
+
+    if (sensorReadFailCount > 15 && !degradedMode) {
+      enterDegradedMode((const __FlashStringHelper*)S_SENSOR_ERR);
+    }
+  }
+}
+
+
+
+void checkAnomalousHumidityDrop() {
+  if (lowWaterAlarmActive || !humidifierState || degradedMode) {
+    if (lowWaterAlarmActive && currentHum > humidityOnHumidifierStart + 2.0f) {
+      lowWaterAlarmActive = false;
+      digitalWrite(BUZZER_PIN, HIGH);
+      forceRedraw = true;
+      uiNeedsUpdate = true;
+      logEvent(F("Сигнал низкого уровня воды сброшен из-за повышения влажности"));
+    }
+    return;
+  }
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(humidifierStartTime, now) > HUMIDITY_DROP_CHECK_DELAY) {
+    if (currentHum < humidityOnHumidifierStart + HUMIDITY_RISE_THRESHOLD) {
+      lowWaterAlarmActive = true;
+      logEvent(F("СИГНАЛ: Влажность не повысилась. Возможно, низкий уровень воды"));
+      setHumidifier(false);
+
+      // >>> БУДИМ ПОДСВЕТКУ СРАЗУ ПРИ ПОДНЯТИИ АВАРИИ
+      analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+      currentBrightness = FULL_BRIGHTNESS;
+      lastTouchTime = now;
+      forceRedraw = true;
+      uiNeedsUpdate = true;
+    }
+  }
+}
+// Усиленная защита: мягче условия и адаптивный порог
+void checkStuckCooler() {
+  const unsigned long now = millis();
+
+  if (coolerStuckAlarmActive || !coolerState || degradedMode) return;
+  if (coolerOnTs == 0) return;
+
+  // Взять актуальный таргет и гистерезис
+  float targetT = settings.targetTemp;
+  float coolH = settings.tempCoolHysteresis;
+  if (program.active && program.currentStage < program.stageCount) {
+    targetT = program.stages[program.currentStage].targetTemp;
+  }
+
+  // Если стартовали не выше таргета + гистерезис — не считаем
+  if (temperatureOnCoolerStart <= targetT + coolH * 0.5f) return;
+
+  // Время ожидания делаем больше (25 мин для 100 л)
+  const unsigned long CHECK_DELAY = 1500000UL;  // 25 мин
+  if (SAFE_MILLIS_DIFF(coolerOnTs, now) < CHECK_DELAY) return;
+
+  // Адаптивный порог падения: не меньше 0.5 °C и не более 1.5 °C
+  float expectedDrop = temperatureOnCoolerStart - targetT;
+  expectedDrop = max(0.5f, min(expectedDrop * 0.4f, 1.5f));
+
+  // Если уже близко к целевому — не тревожим
+  float calibratedTemp = currentTemp + settings.tempBias;
+  if (calibratedTemp <= targetT + coolH * 0.5f) return;
+
+  if (calibratedTemp >= temperatureOnCoolerStart - expectedDrop) {
+    coolerStuckAlarmActive = true;
+    logEvent(F("СИГНАЛ: Температура не снизилась — возможна проблема охладителя"));
+    setCooler(false);
+    analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+    currentBrightness = FULL_BRIGHTNESS;
+    lastTouchTime = now;
+    forceRedraw = true;
+    uiNeedsUpdate = true;
+  }
+}
+
+void checkCoolerMaxRuntime() {
+  unsigned long now = millis();
+
+  // Если уже тревога, или компрессор выключен, или деградация — не трогаем
+  if (coolerStuckAlarmActive || !coolerState || degradedMode) return;
+
+  if (coolerOnTs == 0) return;
+
+  if (SAFE_MILLIS_DIFF(coolerOnTs, now) > MAX_COOLER_RUNTIME) {
+    coolerStuckAlarmActive = true;
+    logEvent(F("СИГНАЛ: Охладитель работал слишком долго (MAX_COOLER_RUNTIME). Отключение компрессора."));
+
+    // Принудительное выключение железа (обход MIN_COOLER_ON_TIME)
+    digitalWrite(COOLER_PIN, HIGH);
+    coolerState = false;
+
+    // Важно: фиксируем OFF timestamp чтобы последующие попытки включения уважали COOLER_MIN_OFF_TIME
+    coolerOffTs = now;
+    coolerOnTs = 0;
+
+    // Подсветка/UI
+    analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+    currentBrightness = FULL_BRIGHTNESS;
+    lastTouchTime = now;
+    forceRedraw = true;
+    uiNeedsUpdate = true;
+
+    // Автовентилятор подстроим (если AUTO)
+    if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+      setFan(heaterState || coolerState || humidifierState);
+    }
+  }
+}
+
+
+
+// ======================================================================
+//           Проверка зависших датчиков (обновлено, меньше ложных)
+// ======================================================================
+void checkStuckSensors() {
+  unsigned long now = millis();
+
+  float tempTarget = settings.targetTemp;
+  float humTarget = settings.targetHum;
+  if (program.active && program.currentStage < program.stageCount) {
+    tempTarget = program.stages[program.currentStage].targetTemp;
+    humTarget = program.stages[program.currentStage].targetHum;
+  }
+
+  float calibratedTemp = currentTemp + settings.tempBias;
+  float calibratedHum = currentHum + settings.humBias;
+
+  // Обновляем «время последнего изменения»
+  if (fabs(currentTemp - lastChangedTemp) > 0.1f) {
+    lastChangedTemp = currentTemp;
+    lastTempChangeTime = now;
+  }
+  if (fabs(currentHum - lastChangedHum) > 0.2f) {
+    lastChangedHum = currentHum;
+    lastHumChangeTime = now;
+  }
+
+  // Более мягкие условия: требуем заметное отклонение от цели и достаточную длительность работы
+  const bool heaterActive = heaterState;
+  const bool coolerActive = coolerState;
+  const bool humidifierActive = humidifierState;
+
+  // Температура: считаем "stuck" только если ошибка > 3°C и исполнитель работал >5 мин
+  if ((heaterActive || coolerActive)) {
+    bool needUp = heaterActive && (calibratedTemp < tempTarget - settings.tempHeatHysteresis * 0.5f);
+    bool needDown = coolerActive && (calibratedTemp > tempTarget + settings.tempCoolHysteresis * 0.5f);
+    bool farFromSet = fabs(calibratedTemp - tempTarget) > 3.0f;
+
+    bool actuatorLong =
+      (heaterActive && SAFE_MILLIS_DIFF(heaterOnTs, now) > 300000UL) || (coolerActive && SAFE_MILLIS_DIFF(coolerOnTs, now) > 300000UL);
+
+    bool timeout = (SAFE_MILLIS_DIFF(lastTempChangeTime, now) > SENSOR_STUCK_TIMEOUT);
+
+    if (farFromSet && (needUp || needDown) && actuatorLong && timeout) {
+      enterDegradedMode((const __FlashStringHelper*)S_SENSOR_ERR);
+      return;
+    }
+  }
+
+  // Влажность: "stuck" только если ошибка > 6% и увлажнитель работал >5 мин
+  if (humidifierActive) {
+    bool farFromSetHum = fabs(calibratedHum - humTarget) > 6.0f;
+    bool needHumUp = (calibratedHum < humTarget - settings.humHysteresis * 0.5f);
+    bool actuatorLong = SAFE_MILLIS_DIFF(humidifierOnTs, now) > 300000UL;
+    bool timeout = (SAFE_MILLIS_DIFF(lastHumChangeTime, now) > SENSOR_STUCK_TIMEOUT);
+
+    if (farFromSetHum && needHumUp && actuatorLong && timeout) {
+      enterDegradedMode((const __FlashStringHelper*)S_SENSOR_ERR);
+      return;
+    }
+  }
+}
+
+// Контроль зависания основного цикла: если долго нет "пульса" — перезагрузка WDT
+void checkWatchdog() {
+  // watchdog_checkpoint_A обновляется в loop() каждый проход
+  if (SAFE_MILLIS_DIFF(watchdog_checkpoint_A, millis()) > WATCHDOG_CHECKPOINT_TIMEOUT) {
+    logEvent(F("КРИТИЧНО: Основной цикл завис.  Перезагрузка..."));
+    wdt_reset();
+    while (true) { /* дождаться аппаратного сброса по WDT */
+    }
+  }
+}
+
+void enterDegradedMode(const __FlashStringHelper* reason) {
+  if (degradedMode) return;
+  degradedMode = true;
+  degradedModeReason = reason ? reason : (const __FlashStringHelper*)S_SENSOR_ERR;
+  lastSensorRecoveryAttempt = millis();
+
+  // Полный сброс PID/Autotune и выходов
+  if (atState == AT_RUNNING) {
+    abortPidAutotune();
+  }
+  pidOutput = 0.0f;
+  pidIntegral = 0.0f;
+  pidLastError = 0.0f;
+  pidWindowStart = millis();
+  heaterDemandPct = 0.0f;
+
+  setHeaterRaw(false);
+  setCooler(false);
+  setHumidifier(false);
+  setFan(false);
+
+  // Подсветка и звук
+  analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+  currentBrightness = FULL_BRIGHTNESS;
+  lastTouchTime = millis();
+
+  if (settings.beeperEnabled) {
+    beeperState = true;
+    digitalWrite(BUZZER_PIN, LOW);
+  } else {
+    beeperState = false;
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
+
+  logEvent(reason);
+  drawDegradedModeOverlay();
+}
+
+
+void exitDegradedMode() {
+  if (!degradedMode) return;
+  degradedMode = false;
+  sensorReadFailCount = 0;
+  digitalWrite(BUZZER_PIN, HIGH);  // выключить пищалку
+  logEvent(F("Система восстановлена из деградированного режима"));
+  unsigned long now = millis();
+  lastTempChangeTime = now;
+  lastHumChangeTime = now;
+  lastChangedTemp = currentTemp;
+  lastChangedHum = currentHum;
+
+  // СБРОС ЭКРАНА И СОСТОЯНИЙ UI
+  currentScreen = SCREEN_MAIN;
+  forceRedraw = true;
+  uiNeedsUpdate = false;
+  for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+    buttonStates[i].pressed = false;
+    buttonStates[i].pressTime = 0;
+  }
+  for (int i = 0; i < SEGMENTS_COUNT; i++) {
+    segs[i].pressed = false;
+    segs[i].pressTime = 0;
+  }
+  // Сразу запустить контроль климата после восстановления
+  DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+  controlManualFan(now_dt);
+  controlTemperature(now_dt);
+  controlHumidity(now_dt);
+  drawStaticLayout();
+}
+
+// ======================================================================
+//                   ПАМЯТЬ, EEPROM, JSON BACKUP/RESTORE
+// ======================================================================
+
+int freeRam() {
+  extern int __heap_start, *__brkval;
+  int v;
+  return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+}
+
+static inline uint16_t crc16_block(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) crc = _crc16_update(crc, data[i]);
+  return crc;
+}
+
+
+void checkEepromCrc() {
+  // Проверка Settings
+  Settings tmp;
+  EEPROM.get(EEPROM_SETTINGS_ADDR, tmp);
+  if (tmp.version == EEPROM_VERSION) {
+    uint16_t crc = calculateCRC((byte*)&tmp, sizeof(Settings) - sizeof(uint16_t));
+    if (crc != tmp.crc) {
+      logEvent(F("Ошибка CRC настроек. Восстановление из BACKUP или по умолчанию"));
+      EEPROM.get(EEPROM_SETTINGS_BACKUP_ADDR, tmp);
+      if (tmp.version == EEPROM_VERSION && calculateCRC((byte*)&tmp, sizeof(Settings) - sizeof(uint16_t)) == tmp.crc) {
+        settings = tmp;
+        saveSettings();
+      } else {
+        initDefaultSettings(settings);
+        saveSettings();
+      }
+    }
+  }
+
+  // Проверка Program
+  CuringProgram tp;
+  EEPROM.get(EEPROM_PROGRAM_ADDR, tp);
+  if (tp.version == EEPROM_VERSION) {
+    uint16_t crc = calculateCRC((byte*)&tp, sizeof(CuringProgram) - sizeof(uint16_t));
+    if (crc != tp.crc) {
+      logEvent(F("Ошибка CRC программы. Сброс на стандартную"));
+      initDefaultProgram(program);
+      saveProgram();
+    }
+  }
+}
+
+void loadSettings() {
+  EEPROM.get(EEPROM_SETTINGS_ADDR, settings);
+  bool ok = false;
+  if (settings.version == EEPROM_VERSION) {
+    uint16_t crc = calculateCRC((byte*)&settings, sizeof(Settings) - sizeof(uint16_t));
+    if (crc == settings.crc) {
+      ok = true;
+    }
+  }
+  if (!ok) {
+    EEPROM.get(EEPROM_SETTINGS_BACKUP_ADDR, settings);
+    if (settings.version == EEPROM_VERSION) {
+      uint16_t crc = calculateCRC((byte*)&settings, sizeof(Settings) - sizeof(uint16_t));
+      if (crc == settings.crc) ok = true;
+    }
+  }
+  if (!ok) {
+    initDefaultSettings(settings);
+    saveSettings();
+  }
+  validateSettings();
+}
+
+void validateSettings() {
+  bool changed = false;
+
+  if (settings.targetTemp < MIN_TEMP || settings.targetTemp > MAX_TEMP) {
+    settings.targetTemp = 15.0f;
+    changed = true;
+  }
+  if (settings.targetHum < MIN_HUM || settings.targetHum > MAX_HUM) {
+    settings.targetHum = 75.0f;
+    changed = true;
+  }
+  if (settings.tempHeatHysteresis < MIN_HYST || settings.tempHeatHysteresis > MAX_HYST_TEMP) {
+    settings.tempHeatHysteresis = STEP_HYST;
+    changed = true;
+  }
+  if (settings.tempCoolHysteresis < MIN_HYST || settings.tempCoolHysteresis > MAX_HYST_TEMP) {
+    settings.tempCoolHysteresis = STEP_HYST;
+    changed = true;
+  }
+  if (settings.humHysteresis < MIN_HYST || settings.humHysteresis > MAX_HYST_HUM) {
+    settings.humHysteresis = STEP_HYST;
+    changed = true;
+  }
+  if (settings.tempBias < MIN_TEMP_BIAS || settings.tempBias > MAX_TEMP_BIAS) {
+    settings.tempBias = 0.0f;
+    changed = true;
+  }
+  if (settings.humBias < MIN_HUM_BIAS || settings.humBias > MAX_HUM_BIAS) {
+    settings.humBias = 0.0f;
+    changed = true;
+  }
+  if (settings.manualFanIntervalHours > MAX_FAN_INTERVAL) {
+    settings.manualFanIntervalHours = 4;
+    changed = true;
+  }
+  if (settings.manualFanDurationMinutes > MAX_FAN_DURATION) {
+    settings.manualFanDurationMinutes = 15;
+    changed = true;
+  }
+  // НОВОЕ: TZ
+  if (settings.tzOffsetHours < -12 || settings.tzOffsetHours > 14) {
+    settings.tzOffsetHours = 3;
+    changed = true;
+  }
+  if (settings.beeperEnabled != false && settings.beeperEnabled != true) {
+    settings.beeperEnabled = true;
+    changed = true;
+  }
+  if (changed) saveSettings();
+
+  // PID sanity
+  if (settings.pidWindowMs < 1000) {
+    settings.pidWindowMs = 1000;
+    changed = true;
+  }
+  if (settings.pidWindowMs > 10000) {
+    settings.pidWindowMs = 10000;
+    changed = true;
+  }
+  if (settings.pidKp < 0.1f) {
+    settings.pidKp = 0.1f;
+    changed = true;
+  }
+  if (settings.pidKi < 0.0f) {
+    settings.pidKi = 0.0f;
+    changed = true;
+  }
+  if (settings.pidKd < 0.0f) {
+    settings.pidKd = 0.0f;
+    changed = true;
+  }
+
+  if (changed) saveSettings();
+}
+
+void saveSettings() {
+  settings.version = EEPROM_VERSION;
+  settings.crc = calculateCRC((byte*)&settings, sizeof(Settings) - sizeof(uint16_t));
+
+  // Сначала пишем в резервную копию
+  EEPROM.put(EEPROM_SETTINGS_BACKUP_ADDR, settings);
+  delay(50);  // даём EEPROM завершить запись
+
+  // Потом в основную
+  EEPROM.put(EEPROM_SETTINGS_ADDR, settings);
+  delay(50);
+
+  settingsDirty = false;
+  logEvent(F("Settings saved"));
+}
+
+
+void saveProgram() {
+  program.version = EEPROM_VERSION;
+  size_t lenNoCrc = offsetof(CuringProgram, crc);
+  program.crc = crc16_block(reinterpret_cast<const uint8_t*>(&program), lenNoCrc);
+  EEPROM.put(EEPROM_PROGRAM_ADDR, program);
+#if DEBUG_SERIAL
+  Serial.println(F("Program saved to EEPROM"));
+#endif
+}
+
+
+// Загрузка программы из EEPROM + миграция + восстановление имени и уставок
+void loadProgram() {
+  CuringProgram p{};
+  EEPROM.get(EEPROM_PROGRAM_ADDR, p);
+
+  bool ok = false;
+  if (p.version == EEPROM_VERSION) {
+    size_t lenNoCrc = offsetof(CuringProgram, crc);
+    uint16_t crc = crc16_block(reinterpret_cast<const uint8_t*>(&p), lenNoCrc);
+    ok = (crc == p.crc);
+  } else if (p.version == 135) {
+    // разрешим миграцию со старой версии без recipeId
+    ok = true;
+  }
+
+  if (!ok) {
+#if DEBUG_SERIAL
+    Serial.println(F("EEPROM program invalid/CRC mismatch. Init default (Koppa)."));
+#endif
+    buildKoppaProgram(program);
+    program.active = false;
+    program.currentStage = 0;
+    program.startMillis = 0;
+    program.startUnixTime = 0;
+    setNameFromRecipeId(program.recipeId);
+    saveProgram();
+    return;
+  }
+
+  program = p;
+
+  if (program.version != EEPROM_VERSION) {
+    if (program.version == 135) {
+      program.recipeId = guessRecipeId(program);
+      program.version = EEPROM_VERSION;
+      saveProgram();
+#if DEBUG_SERIAL
+      Serial.println(F("Program migrated to new EEPROM_VERSION with recipeId."));
+#endif
+    } else {
+      buildKoppaProgram(program);
+      saveProgram();
+    }
+  }
+
+  if (program.active) {
+    setNameFromRecipeId(program.recipeId);
+    if (program.currentStage >= program.stageCount) program.currentStage = 0;
+
+    settings.targetTemp = program.stages[program.currentStage].targetTemp;
+    settings.targetHum = program.stages[program.currentStage].targetHum;
+    settings.manualFanIntervalHours = program.stages[program.currentStage].fanInterval;
+    settings.manualFanDurationMinutes = program.stages[program.currentStage].fanDuration;
+    settingsDirty = true;
+
+#if DEBUG_SERIAL
+    Serial.print(F("Program restored. Recipe: "));
+    Serial.println(currentProgramName);
+    Serial.print(F("Current stage: "));
+    Serial.println(program.currentStage);
+#endif
+  } else {
+    setCurrentProgramName("—");
+  }
+}
+
+
+
+// ======================================================================
+//                        ГРАФИКА / ЦВЕТ / ИКОНКИ
+// ======================================================================
+
+uint16_t lerp565(uint16_t a, uint16_t b, float k) {
+  if (k < 0) k = 0;
+  if (k > 1) k = 1;
+  uint8_t r1 = a >> 11, g1 = (a >> 5) & 0x3F, b1 = a & 0x1F;
+  uint8_t r2 = b >> 11, g2 = (b >> 5) & 0x3F, b2 = b & 0x1F;
+  uint8_t r = r1 + (int)((r2 - r1) * k);
+  uint8_t g = g1 + (int)((g2 - g1) * k);
+  uint8_t bb = b1 + (int)((b2 - b1) * k);
+  return (r << 11) | (g << 5) | bb;
+}
+
+uint16_t darken565(uint16_t c, float k) {
+  if (k < 0) k = 0;
+  if (k > 1) k = 1;
+  uint8_t r = c >> 11, g = (c >> 5) & 0x3F, b = c & 0x1F;
+  float f = 1 - k;
+  r = (uint8_t)(r * f);
+  g = (uint8_t)(g * f);
+  b = (uint8_t)(b * f);
+  return (r << 11) | (g << 5) | b;
+}
+
+uint16_t lighten565(uint16_t c, float k) {
+  return lerp565(c, 0xFFFF, k < 0 ? 0 : (k > 1 ? 1 : k));
+}
+
+uint16_t desaturate565(uint16_t c, float amount) {
+  if (amount < 0) amount = 0;
+  if (amount > 1) amount = 1;
+  uint8_t r = (c >> 11) & 0x1F;
+  r = (r << 3) | (r >> 2);
+  uint8_t g = (c >> 5) & 0x3F;
+  g = (g << 2) | (g >> 4);
+  uint8_t b = c & 0x1F;
+  b = (b << 3) | (b >> 2);
+  uint8_t gray = (uint16_t)(30 * r + 59 * g + 11 * b) / 100;
+  r = (uint8_t)(r + (int)((gray - r) * amount));
+  g = (uint8_t)(g + (int)((gray - g) * amount));
+  b = (uint8_t)(b + (int)((gray - b) * amount));
+  uint16_t rr = (r >> 3) & 0x1F;
+  uint16_t gg = (g >> 2) & 0x3F;
+  uint16_t bb = (b >> 3) & 0x1F;
+  return (rr << 11) | (gg << 5) | bb;
+}
+
+void initSegments() {
+  for (int i = 0; i < SEGMENTS_COUNT; i++) {
+    segs[i] = {
+      SEGMENTS_START_X + (SEGMENT_WIDTH + SEGMENTS_GAP) * i,
+      SEGMENTS_Y,
+      SEGMENT_WIDTH,
+      SEGMENTS_HEIGHT,
+      SEGMENTS_RADIUS,
+      i,
+      false,
+      0UL
+    };
+  }
+}
+
+void drawBackground() {
+  // Сплошной цвет вместо градиента
+  uint16_t bgColor = C565(70, 82, 95);
+  tft.fillScreen(bgColor);
+}
+
+void drawVerticalGradientRounded(int x, int y, int w, int h, int r,
+                                 uint16_t cTop, uint16_t cBottom,
+                                 int shadowOffset, bool drawShadow,
+                                 uint16_t shadowColor, uint16_t borderColor,
+                                 bool depressed) {
+  // Игнорируем r и «скругления»: рисуем всё прямоугольниками
+  int yShiftLocal = depressed ? 2 : 0;
+  uint16_t bgColor = C565(70, 82, 95);
+
+  // Очистка фона под элемент
+  int clearX = x - 6 - shadowOffset;
+  int clearY = y - 6 - yShiftLocal;
+  int clearW = w + 12 + 2 * shadowOffset;
+  int clearH = h + 12 + yShiftLocal + shadowOffset;
+  tft.fillRect(clearX, clearY, clearW, clearH, bgColor);
+
+  // Тень (прямоугольная)
+  if (drawShadow && shadowOffset > 0) {
+    tft.fillRect(x + shadowOffset, y + shadowOffset + yShiftLocal, w, h, shadowColor);
+  }
+
+  // Заливка (берём верхний цвет как основной; «градиент» простой — можно оставить единым цветом)
+  uint16_t fillColor = cTop;
+  tft.fillRect(x + yShiftLocal, y + yShiftLocal, w, h, fillColor);
+
+  // Рамка (если есть)
+  uint16_t bc = borderColor ? borderColor : fillColor;
+  tft.drawRect(x + yShiftLocal, y + yShiftLocal, w, h, bc);
+
+  // Эффект «утопленности» — дополнительная внутренняя рамка
+  if (depressed) {
+    tft.drawRect(x + yShiftLocal + 1, y + yShiftLocal + 1, w - 2, h - 2, lighten565(fillColor, 0.35f));
+  }
+}
+
+// ---------------- Иконки ----------------
+void drawWifiIcon(int x, int y, bool connected) {
+  uint16_t color = connected ? C565(0, 220, 0) : C565(255, 0, 0);
+
+  // Центральная жирная "точка"
+  tft.fillCircle(x, y + 6, 4, color);  // Было 2, стало 4
+
+  // Дуги — три "арки", увеличим толщину
+  for (int i = 0; i < 3; i++) {
+    int r = 6 + i * 5;  // Было 4 + i*4, увеличим
+    for (int j = -135; j < -45; j++) {
+      float angle = j * PI / 180;
+      int x1 = x + r * cos(angle);
+      int y1 = y + 6 + r * sin(angle);
+      // Жирная линия: рисуем "полосу" толщиной 3 пикселя
+      tft.drawPixel(x1, y1, color);
+      tft.drawPixel(x1 + 1, y1, color);
+      tft.drawPixel(x1 - 1, y1, color);
+      tft.drawPixel(x1, y1 + 1, color);
+      tft.drawPixel(x1, y1 - 1, color);
+    }
+  }
+}
+
+
+void drawWaterAlarmIcon(int x, int y) {
+  uint16_t red = C565(255, 0, 0);
+  uint16_t dark_red = darken565(red, 0.5f);
+  tft.fillTriangle(x, y - 8, x - 7, y + 4, x + 7, y + 4, red);
+  tft.fillCircle(x, y + 4, 7, red);
+  tft.drawTriangle(x, y - 8, x - 7, y + 4, x + 7, y + 4, dark_red);
+  tft.drawCircle(x, y + 4, 7, dark_red);
+}
+
+void drawMutedBellIcon(int cx, int cy, uint16_t slashColor) {
+  // Золотой залитый колокольчик
+  // + ЖИРНЫЙ и ДЛИННЫЙ красный крест
+
+  uint16_t gold = C565(255, 215, 0);  // Золотой цвет
+
+  // --- РИСУЕМ КОЛОКОЛ ---
+
+  // 1. Дужка
+  tft.fillRect(cx - 2, cy - 8, 4, 3, gold);
+
+  // 2. Верхняя часть купола
+  tft.fillCircle(cx, cy - 2, 5, gold);
+  tft.fillRect(cx - 5, cy - 2, 11, 6, gold);
+
+  // 3. Расширение ("Юбка")
+  tft.fillRect(cx - 6, cy + 2, 13, 2, gold);
+  tft.fillRect(cx - 8, cy + 4, 17, 2, gold);
+
+  // 4. Язычок
+  tft.fillCircle(cx, cy + 6, 2, gold);
+
+  // --- РИСУЕМ КРЕСТ (X) ---
+  // Длиннее (r=9) и Жирнее (3 линии на каждую диагональ)
+
+  int r = 9;  // Радиус размаха (длина)
+
+  // Диагональ 1: \ (слева-вверх -> вправо-вниз)
+  tft.drawLine(cx - r, cy - r, cx + r, cy + r, slashColor);          // Центр
+  tft.drawLine(cx - r + 1, cy - r, cx + r + 1, cy + r, slashColor);  // Толщина +1
+  tft.drawLine(cx - r - 1, cy - r, cx + r - 1, cy + r, slashColor);  // Толщина -1
+
+  // Диагональ 2: / (справа-вверх -> влево-вниз)
+  tft.drawLine(cx + r, cy - r, cx - r, cy + r, slashColor);          // Центр
+  tft.drawLine(cx + r - 1, cy - r, cx - r - 1, cy + r, slashColor);  // Толщина +1
+  tft.drawLine(cx + r + 1, cy - r, cx - r + 1, cy + r, slashColor);  // Толщина -1
+}
+
+
+
+
+
+void iconSun(int cx, int cy, bool active, uint16_t base) {
+  uint16_t centerColor = active ? C565(255, 200, 0) : darken565(base, 0.25f);
+  uint16_t rayColor = active ? C565(255, 165, 0) : base;
+  int r_center = 12;
+  int r_rays_inner = 13;
+  int r_rays_outer = 22;
+  uint16_t outlineColor = active ? 0xFFFF : C565(255, 165, 0);
+
+  if (!active) {
+    tft.drawCircle(cx, cy, r_center, outlineColor);
+  }
+  tft.fillCircle(cx, cy, r_center, centerColor);
+
+  for (int i = 0; i < 8; i++) {
+    float angle = i * PI / 4.0;
+    float angle_offset = PI / 16.0;
+    int x2 = cx + r_rays_outer * cos(angle);
+    int y2 = cy + r_rays_outer * sin(angle);
+    int x_l = cx + r_rays_inner * cos(angle - angle_offset);
+    int y_l = cy + r_rays_inner * sin(angle - angle_offset);
+    int x_r = cx + r_rays_inner * cos(angle + angle_offset);
+    int y_r = cy + r_rays_inner * sin(angle + angle_offset);
+    tft.fillTriangle(x_l, y_l, x_r, y_r, x2, y2, rayColor);
+    if (!active) {
+      tft.drawLine(x_l, y_l, x2, y2, outlineColor);
+      tft.drawLine(x_r, y_r, x2, y2, outlineColor);
+      int mid_x = cx + (r_rays_inner / 2) * cos(angle);
+      int mid_y = cy + (r_rays_inner / 2) * sin(angle);
+      tft.drawLine(cx, cy, mid_x, mid_y, outlineColor);
+    }
+  }
+}
+
+void iconSnowflake(int cx, int cy, bool active, uint16_t base) {
+  uint16_t color = base;
+  float R = 22;
+  for (int i = 0; i < 6; i++) {
+    float angle = i * PI / 3.0;
+    int x1 = cx + R * cos(angle);
+    int y1 = cy + R * sin(angle);
+    tft.drawLine(cx, cy, x1, y1, color);
+
+    float perpAngle = angle + PI / 2.0;
+    float dx_float = cos(perpAngle);
+    float dy_float = sin(perpAngle);
+    int dx = (dx_float > 0) ? (int)(dx_float + 0.5f) : (int)(dx_float - 0.5f);
+    int dy = (dy_float > 0) ? (int)(dy_float + 0.5f) : (int)(dy_float - 0.5f);
+    dx = max(-1, min(1, dx));
+    dy = max(-1, min(1, dy));
+    if (dx != 0 || dy != 0) {
+      tft.drawLine(cx + dx, cy + dy, x1 + dx, y1 + dy, color);
+      tft.drawLine(cx - dx, cy - dy, x1 - dx, y1 - dy, color);
+    }
+
+    float arm_len = R * 0.4;
+    int x_mid = cx + (R * 0.65) * cos(angle);
+    int y_mid = cy + (R * 0.65) * sin(angle);
+
+    float angle_left = angle - PI / 3.0;
+    int x_l = x_mid + arm_len * cos(angle_left);
+    int y_l = y_mid + arm_len * sin(angle_left);
+    tft.drawLine(x_mid, y_mid, x_l, y_l, color);
+    float perpAngle_left = angle_left + PI / 2.0;
+    float dx_l_float = cos(perpAngle_left);
+    float dy_l_float = sin(perpAngle_left);
+    int dx_l = (dx_l_float > 0) ? (int)(dx_l_float + 0.5f) : (int)(dx_l_float - 0.5f);
+    int dy_l = (dy_l_float > 0) ? (int)(dy_l_float + 0.5f) : (int)(dy_l_float - 0.5f);
+    dx_l = max(-1, min(1, dx_l));
+    dy_l = max(-1, min(1, dy_l));
+    if (dx_l != 0 || dy_l != 0) {
+      tft.drawLine(x_mid + dx_l, y_mid + dy_l, x_l + dx_l, y_l + dy_l, color);
+    }
+
+    float angle_right = angle + PI / 3.0;
+    int x_r = x_mid + arm_len * cos(angle_right);
+    int y_r = y_mid + arm_len * sin(angle_right);
+    tft.drawLine(x_mid, y_mid, x_r, y_r, color);
+    float perpAngle_right = angle_right + PI / 2.0;
+    float dx_r_float = cos(perpAngle_right);
+    float dy_r_float = sin(perpAngle_right);
+    int dx_r = (dx_r_float > 0) ? (int)(dx_r_float + 0.5f) : (int)(dx_r_float - 0.5f);
+    int dy_r = (dy_r_float > 0) ? (int)(dy_r_float + 0.5f) : (int)(dy_r_float - 0.5f);
+    dx_r = max(-1, min(1, dx_r));
+    dy_r = max(-1, min(1, dy_r));
+    if (dx_r != 0 || dy_r != 0) {
+      tft.drawLine(x_mid + dx_r, y_mid + dy_r, x_r + dx_r, y_r + dy_r, color);
+    }
+  }
+}
+
+void iconFan(int cx, int cy, bool active, uint16_t base) {
+  uint16_t frameColor, bladeColor, hubColor;
+  if (active) {
+    frameColor = base;
+    bladeColor = lighten565(base, 0.3f);
+    hubColor = darken565(base, 0.4f);
+  } else {
+    frameColor = darken565(base, 0.6f);
+    bladeColor = darken565(base, 0.4f);
+    hubColor = darken565(base, 0.8f);
+  }
+  int r_outer = 22;
+  int r_inner = 18;
+  int r_hub = 6;
+  tft.fillCircle(cx, cy, r_outer, frameColor);
+  tft.fillCircle(cx, cy, r_inner, TCache.bgTop);
+  int num_blades = 5;
+  for (int i = 0; i < num_blades; i++) {
+    float angle = (i * 2.0 * PI / num_blades) + (SAFE_MILLIS_DIFF(0, millis()) / 1000.0f * (active ? 1 : 0));
+    float x1 = cx + cos(angle) * r_hub;
+    float y1 = cy + sin(angle) * r_hub;
+    float angle2 = angle + (PI / num_blades) * 1.5;
+    float x2 = cx + cos(angle2) * r_inner;
+    float y2 = cy + sin(angle2) * r_inner;
+    float angle3 = angle + (PI / num_blades) * 0.7;
+    float x3 = cx + cos(angle3) * r_inner * 1.1;
+    float y3 = cy + sin(angle3) * r_inner * 1.1;
+    tft.fillTriangle((int)x1, (int)y1, (int)x2, (int)y2, (int)x3, (int)y3, bladeColor);
+  }
+  tft.fillCircle(cx, cy, r_hub, hubColor);
+  if (!active) {
+    tft.drawCircle(cx, cy, r_outer, 0xFFFF);
+  } else {
+    tft.drawCircle(cx, cy, r_outer, 0x0000);
+  }
+}
+void updateFanIcon() {
+  // Перерисовка только области вентилятора, с учётом новой высоты сегмента
+  Seg& sg = segs[3];
+
+  // Геометрия и центрирование иконки как в drawSegment()
+  tft.loadFont(RotondaBold20);
+  int labelTop = 10;
+  int labelH = tft.fontHeight();
+  tft.unloadFont();
+
+  int cx = sg.x + sg.w / 2;
+  int cy = (sg.y + labelTop + labelH) + (sg.h - (labelTop + labelH)) / 2;
+
+  // Очистка подложки под вращающуюся иконку, чтобы не «шлейфило»
+  uint16_t bg = TCache.seg[3].bottom;
+  tft.fillCircle(cx, cy, 24, bg);
+
+  // Рисуем саму иконку
+  iconFan(cx, cy, fanState, TCache.seg[3].iconActive);
+}
+
+
+
+
+void iconSettings(int cx, int cy, uint16_t color) {
+  int r_outer = 16;
+  int r_inner = 10;
+  int tooth_len = 5;
+  int tooth_width = 4;
+  tft.fillCircle(cx, cy, r_outer, color);
+  tft.fillCircle(cx, cy, r_inner, TCache.bgTop);
+  tft.drawCircle(cx, cy, r_outer, darken565(color, 0.4));
+  for (int i = 0; i < 8; i++) {
+    float angle = i * PI / 4.0;
+    int x_base = cx + r_outer * cos(angle);
+    int y_base = cy + r_outer * sin(angle);
+    int x_outer = cx + (r_outer + tooth_len) * cos(angle);
+    int y_outer = cy + (r_outer + tooth_len) * sin(angle);
+    tft.fillRect(x_base - tooth_width / 2, y_base - tooth_width / 2, tooth_width, tooth_len + 2, color);
+    tft.fillCircle(x_outer, y_outer, tooth_width / 2, color);
+  }
+}
+
+// ======================================================================
+//                      КОМПОЗИТНЫЕ ЭЛЕМЕНТЫ / БАРЫ СТАТУСА
+// ======================================================================
+void drawDegradedModeOverlay() {
+  const uint16_t redFill = C565(180, 0, 0);
+  const uint16_t redBorder = lighten565(redFill, 0.25f);
+  const uint16_t shadowCol = TCache.shadowColor;
+  const int w = tft.width();
+  const int h = tft.height();
+  tft.setFreeFont(&FreeSansBold12pt7b);  // Менее прожорливый!
+  const int fh = tft.fontHeight();
+  const int padX = 18;
+  const int padY = 12;
+  const int gap = 6;
+  char l1[64], l2src[128], l3src[96];
+  strcpy_P(l1, S_HALTED);
+  strcpy_P(l2src, (PGM_P)degradedModeReason);
+  strcpy_P(l3src, S_TAP_TO_RETRY);
+  const int boxW = w - 40;
+  const int innerW = boxW - padX * 2;
+
+  auto split2 = [&](const char* src, char a[], char b[]) -> int {
+    if (tft.textWidth(src) <= innerW) {
+      strncpy(a, src, 63);
+      a[63] = '\0';
+      b[0] = '\0';
+      return 1;
+    }
+    int best = -1;
+    int len = (int)strlen(src);
+    for (int i = 0; i < len; i++) {
+      if (src[i] == ' ') {
+        char tmp[96];
+        memcpy(tmp, src, i);
+        tmp[i] = '\0';
+        if (tft.textWidth(tmp) <= innerW) best = i;
+        else break;
+      }
+    }
+    if (best < 0) {
+      strncpy(a, src, 63);
+      a[63] = '\0';
+      b[0] = '\0';
+      return 1;
+    }
+    memcpy(a, src, best);
+    a[best] = '\0';
+    int j = best + 1;
+    while (src[j] == ' ') j++;
+    strncpy(b, src + j, 63);
+    b[63] = '\0';
+    return b[0] ? 2 : 1;
+  };
+
+  char l2a[64] = { 0 }, l2b[64] = { 0 };
+  char l3a[64] = { 0 }, l3b[64] = { 0 };
+  int n2 = split2(l2src, l2a, l2b);
+  int n3 = split2(l3src, l3a, l3b);
+
+  const char* lines[5];
+  int n = 0;
+  lines[n++] = l1;
+  lines[n++] = l2a;
+  if (n2 == 2) lines[n++] = l2b;
+  lines[n++] = l3a;
+  if (n3 == 2) lines[n++] = l3b;
+
+  const int boxH = padY * 2 + n * fh + (n - 1) * gap;
+  const int boxX = (w - boxW) / 2;
+  const int boxY = (h - boxH) / 2;
+
+  drawVerticalGradientRounded(
+    boxX, boxY, boxW, boxH, 12,
+    redFill, redFill,
+    4, true, shadowCol, redBorder,
+    false);
+
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_WHITE, redFill);
+  int cx = boxX + boxW / 2;
+  int y = boxY + padY;
+  for (int i = 0; i < n; i++) {
+    tft.drawString(lines[i], cx, y);
+    y += fh + gap;
+  }
+
+  tft.setTextDatum(TL_DATUM);
+
+  // Сброс шрифта
+  if (freeRam() > 900) {
+    tft.unloadFont();
+  } else {
+    tft.setFreeFont(NULL);
+  }
+}
+
+
+void drawStatusBar(bool force, const DateTime& now_dt) {
+  uint16_t statusColor = C565(110, 120, 130);
+  // Раньше были fillRoundRect/drawRoundRect — теперь только fillRect/drawRect
+  tft.fillRect(STATUS_BAR_X, STATUS_BAR_Y, STATUS_BAR_WIDTH, STATUS_BAR_HEIGHT, statusColor);
+  tft.drawRect(STATUS_BAR_X, STATUS_BAR_Y, STATUS_BAR_WIDTH, STATUS_BAR_HEIGHT, TCache.statusBorder);
+
+  int rightX = STATUS_BAR_X + STATUS_BAR_WIDTH - 10;
+  int cy = STATUS_BAR_Y + STATUS_BAR_HEIGHT / 2 - 1;
+  int wifiIconX = rightX - 20;
+  drawWifiIcon(wifiIconX, cy, wifiConnected);
+  ui_prevWifi = wifiConnected;
+
+
+  if (program.active && programPausedByTimeLoss) {
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(C565(255, 180, 0), C565(110, 120, 130));
+    tft.drawString("PAUSE", STATUS_BAR_X + 90, STATUS_BAR_Y + 6);
+    tft.setFreeFont(NULL);
+  }
+
+
+
+  bool validTime =
+    rtcOk && now_dt.year() >= 2025 && now_dt.year() <= 2099 && now_dt.month() >= 1 && now_dt.month() <= 12;
+
+  if (rtcBatteryFault) {
+    strcpy_P(g_char_buffer, S_RTC_BATT_ERR);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TCache.alertColor, statusColor);
+    int w = tft.textWidth(g_char_buffer);
+    int h = tft.fontHeight();
+    int textX = (tft.width() - w) / 2;
+    int textY = STATUS_BAR_Y + (STATUS_BAR_HEIGHT - h) / 2 + h / 8;
+
+    tft.fillRect(textX - 6, STATUS_BAR_Y + 2, w + 12, STATUS_BAR_HEIGHT - 4, statusColor);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(g_char_buffer, textX, textY);
+    tft.unloadFont();
+    return;
+  }
+
+  if (validTime) {
+    tft.setFreeFont(&FreeSans12pt7b);
+    tft.setTextColor(TCache.txtStatus);
+    sprintf(g_char_buffer, "%02d:%02d", now_dt.hour(), now_dt.minute());
+    int h = tft.fontHeight();
+    tft.fillRect(18, 6, 60, 21, statusColor);
+    tft.setCursor(18, 10 + h / 2);
+    tft.print(g_char_buffer);
+
+    sprintf(g_char_buffer, "%02d.%02d.%04d", now_dt.day(), now_dt.month(), now_dt.year());
+    int w = tft.textWidth(g_char_buffer);
+    int dateX = (tft.width() - w) / 2;
+    tft.fillRect(dateX - 2, 6, w + 4, 21, statusColor);
+    tft.setCursor(dateX, 10 + h / 2);
+    tft.print(g_char_buffer);
+  } else {
+    strcpy_P(g_char_buffer, S_RTC_ERR);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TCache.alertColor, statusColor);
+    int w = tft.textWidth(g_char_buffer);
+    int h = tft.fontHeight();
+    int textX = (tft.width() - w) / 2;
+    int textY = STATUS_BAR_Y + (STATUS_BAR_HEIGHT - h) / 2 + h / 8;
+    tft.fillRect(textX - 6, STATUS_BAR_Y + 2, w + 12, STATUS_BAR_HEIGHT - 4, statusColor);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(g_char_buffer, textX, textY);
+    tft.unloadFont();
+  }
+}
+
+void updateStatusBar(const DateTime& now_dt) {
+  static uint16_t lastMinute = 99;
+  static uint8_t lastDay = 0;
+  lastMinute = now_dt.minute();
+  lastDay = now_dt.day();
+  static bool prevRtcOk = true;
+  static bool prevRtcBatt = false;  // было ли ранее предупреждение о батарейке
+  static int rtcErrX = 0;
+  static int rtcErrW = 0;
+  static uint16_t rtcErrBg = 0;
+
+
+  // Перерисовывать статус-бар ТОЛЬКО если сменилось состояние RTC/батарейки или явный forceRedraw
+  bool redraw = (rtcOk != prevRtcOk) || (rtcBatteryFault != prevRtcBatt) || forceRedraw;
+
+  uint16_t statusColor = C565(110, 120, 130);
+  bool validTime =
+    rtcOk && now_dt.year() >= 2025 && now_dt.year() <= 2099 && now_dt.month() >= 1 && now_dt.month() <= 12;
+
+  // Если ранее показывали ошибку RTC/батарейки и теперь вернулись к нормальному времени — очистить область
+  if (rtcErrW > 0 && rtcOk && !rtcBatteryFault && validTime) {
+    // Полностью очищаем и перерисовываем статус-бар
+    uint16_t bgColor = C565(110, 120, 130);
+    tft.fillRect(STATUS_BAR_X, STATUS_BAR_Y, STATUS_BAR_WIDTH, STATUS_BAR_HEIGHT, bgColor);
+    drawStatusBar(true, now_dt);  // Полная перерисовка
+
+    rtcErrX = 0;
+    rtcErrW = 0;
+    rtcErrBg = 0;
+    return;  // Выходим!
+  }
+
+  // 1) Приоритет: батарейка RTC неисправна — РИСУЕМ ТОЛЬКО ПРИ ИЗМЕНЕНИИ (или первый раз)
+  if (rtcBatteryFault) {
+    if (redraw || rtcErrW == 0) {
+      strcpy_P(g_char_buffer, S_RTC_BATT_ERR);
+      tft.loadFont(RotondaBold20);
+      tft.setTextColor(TCache.alertColor, statusColor);
+      int w = tft.textWidth(g_char_buffer);
+      int h = tft.fontHeight();
+      int textX = (tft.width() - w) / 2;
+      int textY = STATUS_BAR_Y + (STATUS_BAR_HEIGHT - h) / 2 + h / 8;
+
+      int clearX = textX - 6;
+      int clearW = w + 12;
+      tft.fillRect(clearX, STATUS_BAR_Y + 2, clearW, STATUS_BAR_HEIGHT - 4, statusColor);
+      tft.setTextDatum(TL_DATUM);
+      tft.drawString(g_char_buffer, textX, textY);
+      tft.unloadFont();
+
+      rtcErrX = clearX;
+      rtcErrW = clearW;
+
+      // Сброс кэшей времени/даты, чтобы при возвращении перерисовались
+      lastMinute = 99;
+      lastDay = 0;
+    }
+
+    // Иконка Wi‑Fi — обновляем ниже и выходим
+  }
+  // 2) Ошибка RTC/время невалидно — РИСУЕМ ТОЛЬКО ПРИ ИЗМЕНЕНИИ (или первый раз)
+  else if (!validTime) {
+    if (redraw || rtcErrW == 0) {
+      strcpy_P(g_char_buffer, S_RTC_ERR);
+      tft.loadFont(RotondaBold20);
+      tft.setTextColor(TCache.alertColor, statusColor);
+      int w = tft.textWidth(g_char_buffer);
+      int h = tft.fontHeight();
+      int textX = (tft.width() - w) / 2;
+      int textY = STATUS_BAR_Y + (STATUS_BAR_HEIGHT - h) / 2 + h / 8;
+
+      int clearX = textX - 6;
+      int clearW = w + 12;
+      tft.fillRect(clearX, STATUS_BAR_Y + 2, clearW, STATUS_BAR_HEIGHT - 4, statusColor);
+      tft.setTextDatum(TL_DATUM);
+      tft.drawString(g_char_buffer, textX, textY);
+      tft.unloadFont();
+
+      rtcErrX = clearX;
+      rtcErrW = clearW;
+
+      // Сброс кэшей времени/даты
+      lastMinute = 99;
+      lastDay = 0;
+    }
+
+    // Иконка Wi‑Fi — обновляем ниже и выходим
+  }
+  // 3) Нормальный режим — показываем время и дату ТОЛЬКО по изменению минуты/дня или если redraw
+  else {
+    tft.setFreeFont(&FreeSans12pt7b);
+    if (now_dt.minute() != lastMinute || redraw) {
+      tft.setTextColor(TCache.txtStatus);
+      sprintf(g_char_buffer, "%02d:%02d", now_dt.hour(), now_dt.minute());
+      int h = tft.fontHeight();
+      int timeX = STATUS_BAR_X + 12;
+      tft.fillRect(timeX, STATUS_BAR_Y + 2, 60, STATUS_BAR_HEIGHT - 5, statusColor);
+      tft.setCursor(18, 10 + h / 2);
+      tft.print(g_char_buffer);
+      lastMinute = now_dt.minute();
+    }
+    if (now_dt.day() != lastDay || redraw) {
+      tft.setTextColor(TCache.txtStatus);
+      sprintf(g_char_buffer, "%02d.%02d.%04d", now_dt.day(), now_dt.month(), now_dt.year());
+      int w = tft.textWidth(g_char_buffer);
+      int h = tft.fontHeight();
+      int dateX = (tft.width() - w) / 2;
+      tft.fillRect(dateX - 2, STATUS_BAR_Y + 2, w + 4, STATUS_BAR_HEIGHT - 5, statusColor);
+      tft.setCursor(dateX, 10 + h / 2);
+      tft.print(g_char_buffer);
+      lastDay = now_dt.day();
+    }
+  }
+
+  // Иконка Wi‑Fi — обновляется по изменению или при принудительном redraw
+
+  int rightX = STATUS_BAR_X + STATUS_BAR_WIDTH - 10;
+  int cy = STATUS_BAR_Y + STATUS_BAR_HEIGHT / 2 - 1;
+  int wifiIconX = rightX - 20;
+
+  // Watchdog Wi‑Fi (если давно нет статуса от ESP — считаем оффлайн)
+  unsigned long ms = millis();
+  if (SAFE_MILLIS_DIFF(lastEspStatusTime, ms) > WIFI_TIMEOUT_MS) {
+    wifiConnected = false;
+  }
+  if (wifiConnected != ui_prevWifi || redraw) {
+    tft.fillRect(wifiIconX - 8, cy - 9, 16, 18, statusColor);
+    drawWifiIcon(wifiIconX, cy, wifiConnected);
+    ui_prevWifi = wifiConnected;
+  }
+
+  // ==== ДОБАВКА: мигающая надпись "РЕЖИМ СУШКИ" в статус-баре ====
+  if (dryingModeActive) {
+    static unsigned long lastDryBlink = 0;
+    static bool dryingBlinkState = false;
+    unsigned long now = millis();
+    const unsigned long DRYING_BLINK_PERIOD = 2600;  // раз в 2.6 сек
+    if (now - lastDryBlink > DRYING_BLINK_PERIOD) {
+      dryingBlinkState = !dryingBlinkState;
+      lastDryBlink = now;
+    }
+    // Зона для надписи ближе к центру, вне времени/даты/WIFI
+    int dryingX = STATUS_BAR_X + 150;
+    int dryingY = STATUS_BAR_Y + 5;
+    int dryingW = 150;  // с запасом ширины
+    int dryingH = 18;
+
+    // Очистить площадку независимо от blinkState:
+    tft.fillRect(dryingX, dryingY, dryingW, dryingH, statusColor);
+
+    if (dryingBlinkState) {
+      tft.setFreeFont(&FreeSansBold12pt7b);
+      tft.setTextColor(C565(255, 140, 0), statusColor);
+      tft.setTextDatum(TL_DATUM);
+      tft.drawString("РЕЖИМ СУШКИ", dryingX, dryingY + 2);
+      tft.setFreeFont(NULL);
+    }
+  }
+  // --- ИНДИКАТОР ВЫКЛЮЧЕННОГО БИПЕРА СЛЕВА ОТ WI-FI ---
+  int bellX = wifiIconX - 26;  // отступ немного левее
+
+  // Всегда очищаем фон под иконкой бипера, чтобы её не "съели" другие перерисовки
+  tft.fillRect(bellX - 8, cy - 9, 20, 18, statusColor);
+
+  // Если звук ОТКЛЮЧЁН — рисуем перечёркнутый красный колокольчик
+  if (!settings.beeperEnabled) {
+    drawMutedBellIcon(bellX, cy, C565(255, 0, 0));
+  }
+
+  prevRtcOk = rtcOk;
+  prevRtcBatt = rtcBatteryFault;
+}
+
+
+
+
+
+// ======================================================================
+//                       КАРТОЧКИ ЗНАЧЕНИЙ / ОБНОВЛЕНИЕ
+// ======================================================================
+
+void drawValueCards() {
+  // Неоновые панели
+  uint16_t neonTempTop = C565(220, 120, 60);
+  uint16_t neonTempBottom = C565(180, 80, 40);
+  uint16_t neonHumTop = C565(40, 140, 200);
+  uint16_t neonHumBottom = C565(30, 90, 160);
+
+  drawVerticalGradientRounded(tempCard.x, tempCard.y, tempCard.w, tempCard.h, tempCard.r,
+                              neonTempTop, neonTempBottom, 3, true, TFT_BLACK, 0, false);
+  iconSun(tempCard.x + CARD_ICON_OFFSET_X, tempCard.y + CARD_ICON_OFFSET_Y, true, neonTempTop);
+
+  drawVerticalGradientRounded(humCard.x, humCard.y, humCard.w, humCard.h, humCard.r,
+                              neonHumTop, neonHumBottom, 3, true, TFT_BLACK, 0, false);
+  uint16_t lightBlue = C565(135, 206, 250);
+  iconDrop(humCard.x + CARD_ICON_OFFSET_X, humCard.y + CARD_ICON_OFFSET_Y, true, lightBlue);
+
+  // Заголовки карточек
+  tft.loadFont(RotondaBold20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  strcpy_P(g_char_buffer, S_TEMPERATURE);
+  int text_width = tft.textWidth(g_char_buffer);
+  tft.drawString(g_char_buffer, tempCard.x + (tempCard.w - text_width) / 2, tempCard.y + 7);
+  strcpy_P(g_char_buffer, S_HUMIDITY);
+  text_width = tft.textWidth(g_char_buffer);
+  tft.drawString(g_char_buffer, humCard.x + (humCard.w - text_width) / 2, humCard.y + 7);
+  tft.unloadFont();
+
+  // --- ADDED: маленькие уставки в правом верхнем углу (целые) ---
+  float spTemp = program.active ? program.stages[program.currentStage].targetTemp : settings.targetTemp;
+  float spHum = program.active ? program.stages[program.currentStage].targetHum : settings.targetHum;
+  int tempInt = (int)roundf(spTemp);
+  int humInt = (int)roundf(spHum);
+
+  char tempLine[16];
+  char humLine[16];
+  snprintf(tempLine, sizeof(tempLine), "%d%c%c", tempInt, 0xB0, 'C');  // 0xB0 — это °
+  snprintf(humLine, sizeof(humLine), "%d%%", humInt);
+
+  tft.setFreeFont(&FreeMonoBold9pt7b);  // <-- жирный моноширинный FreeFont!
+  tft.setTextSize(1);                   // у FreeFont масштаб обычно оставляют 1
+
+  int pad = 4;
+  int tempW = tft.textWidth(tempLine);
+  int humW = tft.textWidth(humLine);
+
+  int tempX = tempCard.x + tempCard.w - tempW - pad;
+  int humX = humCard.x + humCard.w - humW - pad;
+  int tempY = tempCard.y + 3;
+  int humY = humCard.y + 3;
+
+  uint16_t tempBg = neonTempTop;  // тот же что верх панели температуры
+  uint16_t humBg = neonHumTop;    // тот же что верх панели влажности
+
+  tft.setTextColor(TFT_BLACK, tempBg);
+  tft.drawString(tempLine, tempX, tempY);
+  tft.setTextColor(TFT_BLACK, humBg);
+  tft.drawString(humLine, humX, humY);
+
+  tft.setFreeFont(NULL);  // вернуть встроенные шрифты
+  tft.setTextFont(0);
+  tft.setTextSize(1);
+}
+
+void updateValueAreas() {
+  if (degradedMode) return;
+  float calibratedTemp = currentTemp + settings.tempBias;
+  float calibratedHum = currentHum + settings.humBias;
+
+  struct CardInfo {
+    CardRect* card;
+    float value;
+    float& prevValue;
+    uint16_t topColor;
+    uint16_t bottomColor;
+    const char* unit;
+    float redrawEps;
+  };
+
+  CardInfo cards[] = {
+    { &tempCard, calibratedTemp, ui_prevTemp, C565(220, 120, 60), C565(180, 80, 40), S_UNIT_C, 0.01f },
+    { &humCard, calibratedHum, ui_prevHum, C565(40, 140, 200), C565(30, 90, 160), S_UNIT_PCT, 0.1f }
+  };
+
+  for (auto& c : cards) {
+    if (forceRedraw || fabs(c.value - c.prevValue) > c.redrawEps) {
+      int zx = c.card->x + 36, zy = c.card->y + 30, zw = c.card->w - 56, zh = c.card->h - 55;
+      uint16_t innerGlow = lerp565(c.topColor, c.bottomColor, 0.3f);
+      // Было: fillRoundRect(..., 10, ...)
+      tft.fillRect(zx, zy, zw, zh, innerGlow);
+
+      int intPart = (int)c.value;
+      int decPart = abs((int)((c.value - intPart) * 10));
+      char intBuf[8], decBuf[8], unitBuf[8] = { 0 };
+      snprintf(intBuf, sizeof(intBuf), "%d", intPart);
+      snprintf(decBuf, sizeof(decBuf), ".%d", decPart);
+
+      // ИСПРАВЛЕНИЕ: всегда копируем единицы
+      if (c.unit && pgm_read_byte(c.unit) != 0) {
+        strcpy_P(unitBuf, c.unit);
+      }
+
+      tft.setFreeFont(&FreeSansBold18pt7b);
+      tft.setTextSize(2);
+      int w_int = tft.textWidth(intBuf);
+      int h_int = tft.fontHeight();
+
+      tft.setTextSize(1);
+      int w_dec = tft.textWidth(decBuf);
+      int h_dec = tft.fontHeight();
+
+      tft.setFreeFont(&FreeSans12pt7b);
+      int w_unit = tft.textWidth(unitBuf);
+
+      int gap = (unitBuf[0] ? 4 : 0);
+      int total_w = w_int + w_dec + gap + (unitBuf[0] ? w_unit : 0);
+
+      int leftX = zx + (zw - total_w) / 2;
+      int baselineY = zy + (zh + h_int) / 2 - 2;
+
+      tft.setTextColor(TFT_BLACK);
+
+      tft.setFreeFont(&FreeSansBold18pt7b);
+      tft.setTextSize(2);
+      tft.setTextDatum(BL_DATUM);
+      tft.drawString(intBuf, leftX, baselineY);
+
+      tft.setTextSize(1);
+      int decBaselineY = baselineY - (h_int - h_dec) / 2;
+      tft.drawString(decBuf, leftX + w_int, decBaselineY);
+
+      // ИСПРАВЛЕНИЕ: всегда выводим единицы
+      if (unitBuf[0]) {
+        tft.setFreeFont(&FreeSansBold18pt7b);
+        tft.setTextDatum(BL_DATUM);
+        tft.drawString(unitBuf, leftX + w_int + w_dec + gap, baselineY - 7);
+      }
+      tft.setTextDatum(TL_DATUM);
+
+      c.prevValue = c.value;
+    }
+  }
+}
+
+
+void setHeaterRaw(bool on) {
+  // "Сырое" управление выходом нагревателя без антидребезга и min on/off.
+  // Нужно для PID SSR окна и autotune.
+  //
+  // FIX: добавлены МИНИМАЛЬНЫЕ interlock-ограничения, чтобы setHeaterRaw(true)
+  // не обходил защиту компрессора (HEATER_COOLER_LOCKOUT_TIME) в обычном режиме.
+  // В режиме сушки (dryingModeActive) interlock умышленно не применяется.
+
+  unsigned long now = millis();
+
+  // OFF разрешаем всегда (в т.ч. при деградации / аварии)
+  if (!on) {
+    if (heaterState) {
+      digitalWrite(HEATER_PIN, HIGH);
+      heaterState = false;
+      uiNeedsUpdate = true;
+      heaterOffTs = now;
+      heaterOnTs = 0;
+      if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+        setFan(heaterState || coolerState || humidifierState);
+      }
+    }
+    return;
+  }
+
+  // ON: минимальные interlocks (кроме сушки и HW_TEST)
+  if (!dryingModeActive && currentScreen != SCREEN_HW_TEST) {
+    // В деградации нагрев включать нельзя (как в setHeater)
+    if (degradedMode) return;
+
+    // Если компрессор сейчас включен — не греем (исключаем перекрытие)
+    if (coolerState) return;
+
+    // Если недавно выключили компрессор — уважаем lockout
+    if (SAFE_MILLIS_DIFF(coolerOffTs, now) < HEATER_COOLER_LOCKOUT_TIME) return;
+  }
+
+  // Дальше — "raw" включение без min on/off ограничений
+  if (!heaterState) {
+    digitalWrite(HEATER_PIN, LOW);
+    heaterState = true;
+    uiNeedsUpdate = true;
+    heaterOnTs = now;
+
+    if (settings.fanMode == MODE_AUTO && !degradedMode && currentScreen != SCREEN_HW_TEST) {
+      setFan(heaterState || coolerState || humidifierState);
+    }
+  }
+}
+
+// ======================================================================
+//               СЕГМЕНТЫ, ГЛАВНЫЙ ЭКРАН, ТАПЫ, КНОПКИ, UI
+// ======================================================================
+
+// Доп. строки UI в PROGMEM для режимов/сообщений
+const char S_MODE_AUTO[] PROGMEM = "АВТО";
+const char S_MODE_ON[] PROGMEM = "ВКЛ";
+const char S_MODE_OFF[] PROGMEM = "ВЫКЛ";
+const char S_MODE_TIMED[] PROGMEM = "ТАЙМЕР";
+const char S_ERROR[] PROGMEM = "ОШИБКА";
+
+// ---------------- Сегменты (нижние 5 плиток) ----------------
+void drawSegment(int i) {
+  Seg& sg = segs[i];
+  unsigned long now = millis();
+  bool pressed = sg.pressed && (SAFE_MILLIS_DIFF(sg.pressTime, now) < PRESS_VISUAL_MS);
+  int yShiftLocal = pressed ? 1 : 0;
+  int shadow = pressed ? 1 : 3;
+
+  bool active = (i == 0 ? heaterState : (i == 1 ? coolerState : (i == 2 ? humidifierState : (i == 3 ? fanState : true))));
+  if (i == 2 && lowWaterAlarmActive) active = blinkState;
+  if (i == 1 && coolerStuckAlarmActive) active = blinkState;
+
+  const char* pgm_label = (i == 0 ? S_HEAT : (i == 1 ? S_COOL : (i == 2 ? S_HUMIDIFY : (i == 3 ? S_FAN : S_SETTINGS))));
+  strcpy_P(g_char_buffer, pgm_label);
+
+  uint16_t topCol, botCol;
+  uint16_t iconColor = active ? (i == 4 ? TCache.txtMain : TCache.seg[i].iconActive) : TCache.seg[i].iconInactive;
+
+  // Фон плашки (актив/неактив, мигание сигналов)
+  if (!active && !(i == 2 && lowWaterAlarmActive) && !(i == 1 && coolerStuckAlarmActive)) {
+    uint16_t inactiveColor = C565(45, 55, 65);
+    uint16_t inactiveBorder = C565(80, 90, 100);
+    if (pressed) {
+      inactiveColor = darken565(inactiveColor, 0.5f);
+      inactiveBorder = darken565(inactiveBorder, 0.5f);
+    }
+    drawVerticalGradientRounded(sg.x, sg.y + yShiftLocal, sg.w, sg.h, sg.r,
+                                inactiveColor, inactiveColor, shadow, true, TCache.shadowColor, inactiveBorder, pressed);
+  } else {
+    if ((i == 2 && lowWaterAlarmActive) || (i == 1 && coolerStuckAlarmActive)) {
+      if (blinkState) {
+        topCol = TCache.alertColor;
+        botCol = darken565(TCache.alertColor, 0.4f);
+      } else {
+        topCol = desaturate565(darken565(TCache.seg[i].top, 0.70f), 0.65f);
+        botCol = desaturate565(darken565(TCache.seg[i].bottom, 0.75f), 0.65f);
+      }
+    } else {
+      topCol = (i == 4 ? C565(220, 215, 180) : TCache.seg[i].top);
+      botCol = (i == 4 ? C565(180, 175, 140) : TCache.seg[i].bottom);
+    }
+    if (pressed) {
+      topCol = darken565(topCol, 0.5f);
+      botCol = darken565(botCol, 0.5f);
+    }
+    drawVerticalGradientRounded(sg.x, sg.y + yShiftLocal, sg.w, sg.h, sg.r,
+                                topCol, botCol, shadow, true, TCache.shadowColor, 0, pressed);
+    if (active && !pressed && !(i == 2 && lowWaterAlarmActive) && !(i == 1 && coolerStuckAlarmActive)) {
+      int shineH = sg.h / 10;
+      for (int yy = 0; yy < shineH; yy++) {
+        float k = (float)yy / (shineH - 1);
+        uint16_t c = lerp565(lighten565(topCol, 0.50f), topCol, k * k);
+        tft.drawFastHLine(sg.x + 4, sg.y + yShiftLocal + 8 + yy, sg.w - 8, c);
+      }
+    }
+  }
+
+  // Надпись (ROTONDA, вверху плашки)
+  tft.loadFont(RotondaBold20);
+
+  // --- ВСТАВЬ ЭТОТ КУСОК ВМЕСТО СТАРОГО BLOKA textColor ---
+  uint16_t textColor;
+  if (i == 1 && coolerStuckAlarmActive && blinkState) {
+    textColor = TFT_WHITE;  // КРАСНЫЙ фон аварии — белый текст!
+  } else if (!active && i < 4) {
+    textColor = C565(200, 200, 200);
+  } else if ((i == 4) || (i == 1 && active) || (i == 3 && active)) {
+    textColor = TFT_BLACK;
+  } else {
+    textColor = TFT_WHITE;
+  }
+  tft.setTextColor(textColor, TFT_BLACK);
+  // --- конец нового блока ---
+
+  tft.setTextSize(1);
+  int labelTop = 10;
+  int labelH = tft.fontHeight();
+  tft.drawString(g_char_buffer, sg.x + 10, sg.y + yShiftLocal + labelTop);
+  tft.unloadFont();
+
+
+  if (!active && i == 1 && !coolerStuckAlarmActive) iconColor = textColor;
+  // Центр иконок: по центру оставшейся высоты под надписью
+  int cx = sg.x + sg.w / 2;
+  int availableTop = sg.y + yShiftLocal + labelTop + labelH;
+  int cy = availableTop + (sg.h - (labelTop + labelH)) / 2;
+
+  switch (i) {
+    case 0: iconSun(cx, cy, active, iconColor); break;
+    case 1: iconSnowflake(cx, cy, active, iconColor); break;
+    case 2: iconDrop(cx, cy, active, iconColor); break;
+    case 3: iconFan(cx, cy, active, iconColor); break;
+    case 4: iconSettings(cx, cy, iconColor); break;
+  }
+}
+
+
+
+void drawAllSegments() {
+  for (int i = 0; i < 5; i++) drawSegment(i);
+}
+
+void updatePressedVisual() {
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    if (segs[i].pressed && SAFE_MILLIS_DIFF(segs[i].pressTime, now) >= PRESS_VISUAL_MS) {
+      segs[i].pressed = false;
+      drawSegment(i);
+    }
+  }
+}
+
+void updateStateIconsIfNeeded() {
+  if (forceRedraw || degradedMode) {
+    if (!degradedMode) {
+      drawAllSegments();
+    }
+    ui_prevHeater = heaterState;
+    ui_prevCooler = coolerState;
+    ui_prevHumid = humidifierState;
+    ui_prevFan = fanState;
+    return;
+  }
+  if (lowWaterAlarmActive) drawSegment(2);
+  if (coolerStuckAlarmActive) drawSegment(1);
+
+  int changes = 0;
+  if (ui_prevHeater != heaterState) changes++;
+  if (ui_prevCooler != coolerState) changes++;
+  if (ui_prevHumid != humidifierState) changes++;
+  if (ui_prevFan != fanState) changes++;
+
+  if (changes == 0) return;
+  if (changes > 1) {
+    drawAllSegments();
+  } else {
+    if (ui_prevHeater != heaterState) drawSegment(0);
+    if (ui_prevCooler != coolerState && !coolerStuckAlarmActive) drawSegment(1);
+    if (ui_prevHumid != humidifierState && !lowWaterAlarmActive) drawSegment(2);
+    if (ui_prevFan != fanState) drawSegment(3);
+  }
+  ui_prevHeater = heaterState;
+  ui_prevCooler = coolerState;
+  ui_prevHumid = humidifierState;
+  ui_prevFan = fanState;
+}
+
+// ---------------- Главный экран ----------------
+// Кэши для постоянных строк и метрик шрифта
+static int PROGRAM_INACTIVE_textW = -1;
+static int RotondaBold20_height = -1;
+
+void drawStaticLayout() {
+  // Экран и базовый шрифт
+  tft.fillScreen(TFT_BLACK);
+  tft.unloadFont();
+  tft.setTextFont(0);
+  tft.setTextSize(1);
+
+  // Фон и статусбар
+  drawBackground();
+  DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+  drawStatusBar(true, now_dt);
+
+  // Карточки
+  tempCard = { TEMP_CARD_X, CARD_Y, CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS };
+  humCard = { HUM_CARD_X, CARD_Y, CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS };
+
+  // Базовые параметры баров (X, W и H не меняем)
+  progressCard = { LEFT_PROGRESS_X, PROGRESS_BAR_Y, LEFT_PROGRESS_WIDTH, PROGRESS_BAR_HEIGHT, PROGRESS_BAR_RADIUS };
+  totalProgressCard = { RIGHT_PROGRESS_X, PROGRESS_BAR_Y, RIGHT_PROGRESS_WIDTH, PROGRESS_BAR_HEIGHT, PROGRESS_BAR_RADIUS };
+
+  // Сегменты (кнопки внизу)
+  if (program.active) {
+    const int newSegH = (int)(SEGMENTS_HEIGHT * 0.75f);  // 104 -> 78
+    const int newSegY = SCREEN_HEIGHT - 5 - newSegH;     // отступ 5 px от низа
+    for (int i = 0; i < SEGMENTS_COUNT; i++) {
+      segs[i].y = newSegY;
+      segs[i].h = newSegH;
+    }
+  } else {
+    // ВОССТАНОВИТЬ ПОЛНУЮ ФОРМУ
+    for (int i = 0; i < SEGMENTS_COUNT; i++) {
+      segs[i].y = SEGMENTS_Y;
+      segs[i].h = SEGMENTS_HEIGHT;
+    }
+  }
+
+
+  // Рисуем карточки
+  drawValueCards();
+
+  if (program.active) {
+    // Геометрия: подписи → бары → плашка "ПРОГРАММА"
+    const int cardsBottom = tempCard.y + tempCard.h;  // низ карточек
+    tft.loadFont(RotondaBold20);
+    const int fh = tft.fontHeight();  // высота шрифта подписей
+    tft.unloadFont();
+
+    // 1) Подписи “ЭТАП:” и “ОБЩИЙ ПРОГРЕСС:” — на 4 px ниже карточек
+    const int labelTopY = cardsBottom + 8;
+
+    // 2) Бары — на 4 px ниже подписей
+    const int barsY = labelTopY + fh + 8;
+    progressCard.y = barsY;
+    totalProgressCard.y = barsY;
+    // 3) Сначала рисуем бары (подписи отрисуются внутри функций баров)
+    drawMainProgressBar(true);
+    drawTotalProgressBar(true);
+
+    // 4) Полоска “ПРОГРАММА:” — на 5 px ниже баров, тянется до верха сегментов, оставляя 5 px
+    const int barBottom = barsY + PROGRESS_BAR_HEIGHT;
+    int boxY = barBottom + 10;
+
+    const int buttonsTopY = segs[0].y;   // верх сегментов
+    int maxH = buttonsTopY - 10 - boxY;  // 5 px зазор до сегментов
+    if (maxH > 0) {
+      // Короткое имя программы
+      char shortName[24] = "—";
+      if (strstr(currentProgramName, "САЛЬЧИЧОН")) strcpy(shortName, "САЛЬЧИЧОН");
+      else if (strstr(currentProgramName, "ФУЭТ")) strcpy(shortName, "ФУЭТ");
+      else if (strstr(currentProgramName, "КОППА")) strcpy(shortName, "КОППА");
+      else if (strstr(currentProgramName, "ХАМОН")) strcpy(shortName, "ХАМОН");
+      else {
+        strncpy(shortName, currentProgramName, sizeof(shortName) - 1);
+        shortName[sizeof(shortName) - 1] = '\0';
+      }
+
+      const char* prefix = "Программа: ";
+      char daysBuf[48] = { 0 };
+
+      // Остаток дней
+      uint64_t totalElapsedMs = programElapsedMsUnixOnly();  // только UNIX
+      uint64_t totalDurationMs = 0;
+      for (uint8_t s = 0; s < program.stageCount; s++)
+        totalDurationMs += (uint64_t)program.stages[s].durationHours * MILLIS_PER_HOUR;
+
+      uint64_t remainMs = (totalElapsedMs < totalDurationMs) ? (totalDurationMs - totalElapsedMs) : 0;
+      unsigned long daysRemain = (unsigned long)((remainMs + MILLIS_PER_DAY - 1) / MILLIS_PER_DAY);
+      auto daysWord = [](unsigned long d) -> const char* {
+        unsigned long n = d % 100;
+        if (n >= 11 && n <= 14) return "дней";
+        n = d % 10;
+        if (n == 1) return "день";
+        if (n >= 2 && n <= 4) return "дня";
+        return "дней";
+      };
+
+      snprintf(daysBuf, sizeof(daysBuf), "  %lu %s осталось", daysRemain, daysWord(daysRemain));
+      // Ширина полоски под текст
+      tft.loadFont(RotondaBold20);
+      tft.setTextSize(1);
+      int wPrefix = tft.textWidth(prefix);
+      int wName = tft.textWidth(shortName);
+      int wDays = tft.textWidth(daysBuf);
+      int textW = wPrefix + wName + wDays;
+
+      const int padX = 5;
+      int boxW = textW + padX * 2 + 10;  // +10 ширины
+      int maxBoxW = tft.width() - 20;
+      if (boxW > maxBoxW) boxW = maxBoxW;
+      int boxX = (tft.width() - boxW) / 2;
+
+      // Высота полоски — тянется до кнопок, но оставляет 5 px
+      int boxH = maxH + 5;               // максимально доступная
+      if (boxH < fh + 6) boxH = fh + 4;  // минимально комфортная
+
+      // Рисуем полоску (менее скруглённые углы)
+      uint16_t lightGray = C565(150, 150, 150);
+      uint16_t border = C565(180, 180, 180);
+      drawVerticalGradientRounded(boxX, boxY, boxW, boxH, 5,
+                                  lightGray, lightGray, 2, true, TCache.shadowColor, border, false);
+
+
+
+      // Текст внутри полоски
+      int textY = boxY + (boxH - fh) / 2 - 2;
+      int cursorX = boxX + padX;
+
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(prefix, cursorX, textY);
+      cursorX += wPrefix;
+
+      // Имя программы — оранжевый!
+      uint16_t neonTempTop = C565(255, 100, 0);  // ярко-оранжевый
+      tft.setTextColor(neonTempTop, TFT_BLACK);  // Оранжевый текст
+      tft.drawString(shortName, cursorX, textY);
+      cursorX += wName;
+
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);  // вернуть белый для дней
+      tft.drawString(daysBuf, cursorX, textY);
+
+      // Запоминаем область "дней" для быстрых локальных обновлений
+      g_daysX = cursorX;
+      g_daysY = textY;
+      g_daysH = fh;
+      g_daysBG = lightGray;
+      g_daysLast = daysRemain;
+      g_daysLastW = wDays;
+      g_daysReady = true;
+
+      tft.unloadFont();
+    }
+  } else {
+    // Блок "ПРОГРАММА НЕАКТИВНА"
+    const int w = tft.width();
+    const int boxW = 260, boxH = 30, boxX = (w - boxW) / 2, boxY = 165, boxR = 8;
+    const uint16_t darkGrayTop = C565(80, 80, 80), darkGrayBottom = C565(50, 50, 50);
+
+    tft.startWrite();
+    drawVerticalGradientRounded(boxX, boxY, boxW, boxH, boxR, darkGrayTop, darkGrayBottom, 3, true, TCache.shadowColor, 0xFFFF, false);
+
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(C565(180, 180, 180), TFT_BLACK);
+    tft.setTextSize(1);
+
+    if (RotondaBold20_height < 0) RotondaBold20_height = tft.fontHeight();
+
+    strcpy_P(g_char_buffer, S_PROGRAM_INACTIVE);
+    if (PROGRAM_INACTIVE_textW < 0) PROGRAM_INACTIVE_textW = tft.textWidth(g_char_buffer);
+
+    const int textY = boxY + (boxH - RotondaBold20_height) / 2;
+    tft.drawString(g_char_buffer, boxX + (boxW - PROGRAM_INACTIVE_textW) / 2, textY);
+    tft.unloadFont();
+    tft.endWrite();
+  }
+
+  // Обновление значений
+  ui_prevTemp = -999.0f;
+  ui_prevHum = -999.0f;
+  updateValueAreas();
+
+  // Сегменты снизу
+  drawAllSegments();
+  for (int i = 0; i < SEGMENTS_COUNT; i++) {
+    segs[i].pressed = false;
+    segs[i].pressTime = 0;
+  }
+
+  forceRedraw = false;
+  uiNeedsUpdate = false;
+  resetProgressBarCaches();
+}
+
+
+
+
+// ---------------- Тапы по сегментам (главный экран) ----------------
+
+void handleTap(int x, int y) {
+  const unsigned long now = millis();
+  lastTouchTime = now;
+
+  // Поднять подсветку, если была погашена
+  if (currentBrightness != FULL_BRIGHTNESS) {
+    analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+    currentBrightness = FULL_BRIGHTNESS;
+    lastBrightnessChange = now;
+  }
+
+  if (y < 34) return;
+
+  // --- ТАП ПО БОЛЬШИМ КАРТОЧКАМ ---
+
+  // Карточка температуры
+  if (x >= tempCard.x && x <= tempCard.x + tempCard.w && y >= tempCard.y && y <= tempCard.y + tempCard.h) {
+    beepClick();
+    currentScreen = SCREEN_HEATER;
+    drawHeaterSettingsScreen(true);
+    return;
+  }
+
+  // Карточка влажности
+  if (x >= humCard.x && x <= humCard.x + humCard.w && y >= humCard.y && y <= humCard.y + humCard.h) {
+    beepClick();
+    currentScreen = SCREEN_HUMID;
+    drawHumidSettingsScreen(true);
+    return;
+  }
+
+  // --- НИЖНИЕ СЕГМЕНТЫ ---
+
+  for (int i = 0; i < 5; i++) {
+    Seg& sg = segs[i];
+    if (x >= sg.x && x <= sg.x + sg.w && y >= sg.y && y <= sg.y + sg.h) {
+
+      beepClick();  // БИП ТОЛЬКО ПРИ ПОПАДАНИИ В СЕГМЕНТ
+
+      sg.pressed = true;
+      sg.pressTime = millis();
+      drawSegment(i);
+      switch (i) {
+        case 0:
+          currentScreen = SCREEN_HEATER;
+          drawHeaterSettingsScreen(true);
+          break;
+
+        case 1:
+          // ✅ НОВОЕ: если мигает авария охладителя — только сброс, без входа в экран
+          if (coolerStuckAlarmActive) {
+            coolerStuckAlarmActive = false;
+            beeperState = false;
+            digitalWrite(BUZZER_PIN, HIGH);  // выключить пищалку
+            uiNeedsUpdate = true;
+            forceRedraw = true;
+
+            // можно сразу перерисовать сегмент, чтобы перестал мигать
+            drawSegment(1);
+            return;  // <<< КЛЮЧЕВОЕ: остаёмся на главном экране
+          }
+
+          currentScreen = SCREEN_COOLER;
+          drawCoolerSettingsScreen(true);
+          break;
+
+        case 2:  // Влажность
+          // ✅ НОВОЕ: если мигает авария увлажнителя — только сброс, без входа в экран
+          if (lowWaterAlarmActive) {
+            lowWaterAlarmActive = false;
+            beeperState = false;
+            digitalWrite(BUZZER_PIN, HIGH);  // выключить пищалку
+            uiNeedsUpdate = true;
+            forceRedraw = true;
+
+            drawSegment(2);
+            return;  // <<< КЛЮЧЕВОЕ: остаёмся на главном экране
+          }
+
+          currentScreen = SCREEN_HUMID;
+          drawHumidSettingsScreen(true);
+          break;
+
+        case 3:
+          currentScreen = SCREEN_FAN;
+          drawFanSettingsScreen(true);
+          break;
+
+        case 4:
+          currentScreen = SCREEN_SETTINGS_HUB;
+          drawSettingsHubScreen(true);
+          break;
+      }
+      return;
+    }
+  }
+}
+
+// ---------------- Обновление UI (главный) ----------------
+
+void refreshUI(const DateTime& now_dt) {
+  tft.startWrite();
+
+  if (degradedMode) {
+    // Можно обновлять статус-бар (например WiFi/время), но после этого
+    // ОБЯЗАТЕЛЬНО снова рисуем оверлей, чтобы он был "верхним слоем".
+    updateStatusBar(now_dt);
+
+    // Перерисовать плашку деградации поверх всего, чтобы ничего не "проступало".
+    drawDegradedModeOverlay();
+
+    tft.endWrite();
+    forceRedraw = false;
+    return;
+  }
+
+
+  updateStatusBar(now_dt);
+  updateValueAreas();
+  // Обновляем только цифры "X дней осталось" в плашке ПРОГРАММА
+  if (currentScreen == SCREEN_MAIN && program.active && g_daysReady) {
+
+    // Подсчёт оставшихся дней
+    uint64_t totalElapsedMs = programElapsedMsUnixOnly();  // только UNIX
+    uint64_t totalDurationMs = 0;
+    for (uint8_t s = 0; s < program.stageCount; s++)
+      totalDurationMs += (uint64_t)program.stages[s].durationHours * MILLIS_PER_HOUR;
+
+    uint64_t remainMs = (totalElapsedMs < totalDurationMs) ? (totalDurationMs - totalElapsedMs) : 0;
+    unsigned long daysRemain = (unsigned long)((remainMs + MILLIS_PER_DAY - 1) / MILLIS_PER_DAY);
+
+    auto daysWord = [](unsigned long d) -> const char* {
+      unsigned long n = d % 100;
+      if (n >= 11 && n <= 14) return "дней";
+      n = d % 10;
+      if (n == 1) return "день";
+      if (n >= 2 && n <= 4) return "дня";
+      return "дней";
+    };
+
+    char daysBuf[48];
+    snprintf(daysBuf, sizeof(daysBuf), "  %lu %s осталось", daysRemain, daysWord(daysRemain));
+    // Быстрая локальная перерисовка хвоста
+    tft.loadFont(RotondaBold20);
+    tft.setTextSize(1);
+    int newW = tft.textWidth(daysBuf);
+
+    if (daysRemain != g_daysLast || newW != g_daysLastW) {
+      // Уменьшаем очистку: сверху на 4px меньше, снизу на 3px меньше
+      int clearW = max(g_daysLastW, newW);  // ширину оставляем с запасом
+      int clearY = max(0, g_daysY);
+      int clearH = g_daysH + 6;
+      if (clearY + clearH > tft.height()) clearH = tft.height() - clearY;
+
+      tft.fillRect(g_daysX, clearY, clearW, clearH, g_daysBG);
+    }
+
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, g_daysBG);
+    tft.drawString(daysBuf, g_daysX, g_daysY);
+
+    g_daysLast = daysRemain;
+    g_daysLastW = newW;
+    tft.unloadFont();
+  }
+
+  updateStateIconsIfNeeded();
+  updatePressedVisual();
+  tft.endWrite();
+  forceRedraw = false;
+}
+
+
+// ---------------- Обработка касаний глобально ----------------
+bool getTouchPoint(int& x, int& y) {
+  static bool haveTouch = false;          // есть ли сейчас реальное касание
+  static unsigned long touchStartMs = 0;  // когда оно началось
+  static int lastX = -1, lastY = -1;
+  static uint8_t stableCount = 0;
+
+  FT6336U_TouchPointType tp = ctp.scan();
+
+  // Нет касания по мнению FT6336U
+  if (tp.touch_count == 0) {
+    haveTouch = false;
+    touchStartMs = 0;
+    lastX = lastY = -1;
+    stableCount = 0;
+    return false;
+  }
+
+  // Сырые координаты
+  int rawX = tp.tp[0].x;
+  int rawY = tp.tp[0].y;
+
+  // Преобразование под ориентацию экрана (как было)
+  int sx = 479 - rawY;
+  int sy = rawX;
+  sx = constrain(sx, 0, tft.width() - 1);
+  sy = constrain(sy, 0, tft.height() - 1);
+
+  unsigned long now = millis();
+
+  // Первое появление касания
+  if (!haveTouch) {
+    haveTouch = true;
+    touchStartMs = now;
+    lastX = sx;
+    lastY = sy;
+    stableCount = 1;
+    return false;  // пока считаем это "предварительным" касанием
+  }
+
+  // Уже есть касание – проверим, не слишком ли прыгнула точка
+  const int MOVE_TOLERANCE = 15;  // допуск дрожания/съезда пальца
+
+  if (abs(sx - lastX) <= MOVE_TOLERANCE && abs(sy - lastY) <= MOVE_TOLERANCE) {
+    stableCount++;
+  } else {
+    // слишком резкий прыжок – начинаем считать как новое касание
+    haveTouch = true;
+    touchStartMs = now;
+    stableCount = 1;
+    lastX = sx;
+    lastY = sy;
+    return false;
+  }
+
+  lastX = sx;
+  lastY = sy;
+
+  // Минимальное время и стабильность, чтобы это не был одиночный шум
+  const unsigned long MIN_TOUCH_TIME_MS = 10;  // минимум 35 мс "живого" касания
+  const uint8_t MIN_STABLE_SAMPLES = 2;        // минимум 2 стабильных кадра
+
+  if ((now - touchStartMs) < MIN_TOUCH_TIME_MS) return false;
+  if (stableCount < MIN_STABLE_SAMPLES) return false;
+
+  // Теперь считаем это реальным фронтом касания – вернём координату ОДИН раз
+  x = sx;
+  y = sy;
+
+  // Чтобы не срабатывало ещё раз во время того же удержания, сбрасывать не будем.
+  // Повторные кадры этого же касания будут отфильтрованы выше.
+  // Следующий "true" мы вернём только после того, как палец уберут и поставят снова.
+
+  // Но чтобы не спамить тем же фронтом на каждом loop, искусственно сбросим:
+  haveTouch = false;
+  touchStartMs = 0;
+  stableCount = 0;
+  lastX = lastY = -1;
+
+  return true;
+}
+
+
+// Будильник подсветки: включает FULL сразу на любой отпечаток пальца,
+// даже до стабилизации (двух подряд выборок). Это касание не обрабатываем.
+static inline bool wakeOnRawTouchIfDim() {
+  if (currentBrightness == FULL_BRIGHTNESS) return false;
+
+  // Сырой опрос FT6336U (без фильтра стабильности)
+  FT6336U_TouchPointType tp = ctp.scan();
+  if (tp.touch_count > 0) {
+    analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);  // включить подсветку
+    currentBrightness = FULL_BRIGHTNESS;
+    unsigned long now = millis();
+    lastBrightnessChange = now;  // если не используете — можно убрать
+    lastTouchTime = now;         // чтобы таймер сна видел «активность»
+    return true;                 // на этом тике касание не обрабатываем
+  }
+  return false;
+}
+
+void handleTouch() {
+  static unsigned long lastActionTime = 0;
+
+  // Если подсветка погашена — разбудить её на любое "сырое" касание и выйти
+  if (wakeOnRawTouchIfDim()) return;
+
+  int x, y;
+  if (!getTouchPoint(x, y)) return;
+
+  const unsigned long now = millis();
+  lastActionTime = now;
+  lastTouchTime = now;
+
+  // Поднять подсветку, если была погашена
+  if (currentBrightness != FULL_BRIGHTNESS) {
+    analogWrite(BACKLIGHT_PIN, FULL_BRIGHTNESS);
+    currentBrightness = FULL_BRIGHTNESS;
+    lastBrightnessChange = now;
+  }
+
+  // ==========================================================
+  // 1) ДЕГРАДИРОВАННЫЙ РЕЖИМ: тап = попытка восстановления
+  // ==========================================================
+  if (degradedMode) {
+    logEvent(F("Пользователь подтвердил деградированный режим. Попытка восстановления"));
+    exitDegradedMode();
+    readSensors();
+    return;
+  }
+
+  // ==========================================================
+  // 2) КВИТИРОВАНИЕ АВАРИЙ ТОЛЬКО ПО "СВОЕМУ" МИГАЮЩЕМУ СЕГМЕНТУ
+  //    - lowWaterAlarmActive  -> сегмент i==2 (ВЛАЖ)
+  //    - coolerStuckAlarmActive -> сегмент i==1 (ХОЛОД)
+  //
+  //    КЛЮЧЕВОЕ: если попали в мигающий сегмент — сбрасываем и RETURN,
+  //    чтобы НЕ открыть экраны влажности/охладителя.
+  // ==========================================================
+  if (currentScreen == SCREEN_MAIN) {
+    // Сегмент "ХОЛОД" (i==1)
+    if (coolerStuckAlarmActive) {
+      Seg& sg = segs[1];
+      if (x >= sg.x && x <= sg.x + sg.w && y >= sg.y && y <= sg.y + sg.h) {
+        coolerStuckAlarmActive = false;
+        beeperState = false;
+        digitalWrite(BUZZER_PIN, HIGH);  // выключить пищалку
+
+        // сразу обновим внешний вид сегмента
+        sg.pressed = false;
+        drawSegment(1);
+
+        uiNeedsUpdate = true;
+        forceRedraw = true;
+        return;  // <<< НЕ открываем экран охладителя
+      }
+    }
+
+    // Сегмент "ВЛАЖ" (i==2)
+    if (lowWaterAlarmActive) {
+      Seg& sg = segs[2];
+      if (x >= sg.x && x <= sg.x + sg.w && y >= sg.y && y <= sg.y + sg.h) {
+        lowWaterAlarmActive = false;
+        beeperState = false;
+        digitalWrite(BUZZER_PIN, HIGH);  // выключить пищалку
+
+        sg.pressed = false;
+        drawSegment(2);
+
+        uiNeedsUpdate = true;
+        forceRedraw = true;
+        return;  // <<< НЕ открываем экран влажности
+      }
+    }
+  }
+
+  // ==========================================================
+  // 3) Обычная маршрутизация тача (если не было квитирования)
+  // ==========================================================
+  switch (currentScreen) {
+    case SCREEN_MAIN: handleTap(x, y); break;
+    case SCREEN_SETTINGS_HUB: handleSettingsHubTouch(x, y); break;
+    case SCREEN_PID: handlePidTouch(x, y); break;
+    case SCREEN_RECIPES: handleRecipeTouch(x, y); break;
+
+    case SCREEN_HEATER:
+    case SCREEN_COOLER:
+    case SCREEN_HUMID:
+    case SCREEN_FAN:
+    case SCREEN_CALIBRATION:
+      handleSettingsTouch(x, y, currentScreen);
+      break;
+
+    case SCREEN_HW_TEST: handleHwTestTouch(x, y); break;
+    case SCREEN_SYSTEM: handleSystemTouch(x, y); break;
+    case SCREEN_SET_CLOCK: handleSetClockTouch(x, y); break;
+    case SCREEN_KOPPA: handleKoppaTouch(x, y); break;
+    case SCREEN_EEPROM_WIPE: handleEepromWipeTouch(x, y); break;
+    case SCREEN_HAMON: handleHamonTouch(x, y); break;
+    case SCREEN_SALCHICHON: handleSalchichonTouch(x, y); break;
+    case SCREEN_FUET: handleFuetTouch(x, y); break;
+  }
+}
+
+// ---------------- Кнопки: отрисовка и обновление визуала ----------------
+bool inBtn(const Button& b, int x, int y) {
+  return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+}
+
+void drawButton(const Button& b, const char* label, uint16_t fill, uint16_t border, bool active, bool pressed) {
+  uint16_t fillColor = active ? fill : darken565(fill, 0.7f);
+  uint16_t borderColor = border ? border : darken565(fillColor, 0.2f);
+
+  if (&b == &btnBack && pressed) {
+    fillColor = C565(0, 30, 0);
+  }
+  if (&b == &btnVal1Minus || &b == &btnVal1Plus || &b == &btnVal2Minus || &b == &btnVal2Plus) {
+    fillColor = pressed ? C565(20, 20, 20) : C565(60, 60, 60);
+  }
+
+  const int clearX = b.x - 4, clearY = b.y - 4, clearW = b.w + 8, clearH = b.h + 8;
+  const uint16_t bgColor = C565(70, 82, 95);
+
+  // Градиенты и блик — как было, но без лишних повторных вычислений
+  const uint16_t topFillBase = lighten565(fillColor, 0.1f);
+  const uint16_t topFillPressed = darken565(fillColor, 0.4f);
+  const uint16_t bottomFillBase = darken565(fillColor, 0.2f);
+  const uint16_t bottomFillPr = darken565(fillColor, 0.7f);
+  const uint16_t topFill = pressed ? topFillPressed : topFillBase;
+  const uint16_t bottomFill = pressed ? bottomFillPr : bottomFillBase;
+
+  tft.startWrite();
+  tft.fillRect(clearX, clearY, clearW, clearH, bgColor);
+
+  drawVerticalGradientRounded(b.x, b.y + (pressed ? yShift : 0), b.w, b.h, 8,
+                              topFill, bottomFill, pressed ? 1 : 2,
+                              true, TCache.shadowColor, borderColor, pressed);
+
+  if (!pressed && active) {
+    const int shineH = b.h / 5;
+    const uint16_t shineFrom = lighten565(topFill, 0.3f);  // вычислить один раз
+    for (int yy = 0; yy < shineH; yy++) {
+      const float k = (float)yy / (shineH - 1);
+      const uint16_t c = lerp565(shineFrom, topFill, k * k);
+      tft.drawFastHLine(b.x + 4, b.y + 4 + yy, b.w - 8, c);
+    }
+  }
+
+  // Быстрый путь для +/- без шрифта и strcmp
+  const bool isMinus = (label[0] == '-') && (label[1] == '\0');
+  const bool isPlus = (label[0] == '+') && (label[1] == '\0');
+  if (&b == &btnVal1Minus || &b == &btnVal1Plus || &b == &btnVal2Minus || &b == &btnVal2Plus) {
+    const int cx = b.x + b.w / 2;
+    const int cy = b.y + (pressed ? yShift : 0) + b.h / 2;
+    const uint16_t lineColor = pressed ? C565(20, 20, 20) : TFT_WHITE;
+    const int lineLen = 25, lineThick = 5;
+
+    tft.fillRect(cx - lineLen / 2, cy - lineThick / 2, lineLen, lineThick, lineColor);
+    if (isPlus) {
+      tft.fillRect(cx - lineThick / 2, cy - lineLen / 2, lineThick, lineLen, lineColor);
+    }
+    tft.endWrite();
+    return;
+  }
+
+  // Надпись как была — с тем же шрифтом и цветами
+  tft.loadFont(RotondaBold20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  const int text_width = tft.textWidth(label);
+  const int text_height = tft.fontHeight();
+  const int text_x = b.x + (b.w - text_width) / 2;
+  const int text_y = b.y + (pressed ? yShift : 0) + (b.h - text_height) / 2;
+  tft.drawString(label, text_x, text_y);
+  tft.unloadFont();
+  tft.endWrite();
+}
+
+
+// --- ЗАМЕНИТЬ полностью updateButtonVisuals ---
+
+
+void updateButtonVisuals() {
+  // На экране проверки аппаратуры не трогаем общие +/- кнопки
+  if (currentScreen == SCREEN_HW_TEST) return;
+
+  static unsigned long lastButtonUpdate = 0;
+  const unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastButtonUpdate, now) < BUTTON_UPDATE_RATE_MS) return;
+
+  bool anyButtonUpdated = false;
+
+  for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+    // ждём, пока "нажатое" состояние пройдет
+    if (buttonStates[i].pressed && SAFE_MILLIS_DIFF(buttonStates[i].pressTime, now) < PRESS_VISUAL_MS) continue;
+
+    // На каких экранах следим за обычными кнопками
+    bool isRelevantScreen = false;
+    if (currentScreen == SCREEN_HEATER || currentScreen == SCREEN_COOLER || currentScreen == SCREEN_HUMID || currentScreen == SCREEN_FAN || currentScreen == SCREEN_CALIBRATION || currentScreen == SCREEN_SET_CLOCK || currentScreen == SCREEN_RECIPES || currentScreen == SCREEN_HW_TEST || currentScreen == SCREEN_SYSTEM || currentScreen == SCREEN_EEPROM_WIPE || currentScreen == SCREEN_KOPPA || currentScreen == SCREEN_HAMON || currentScreen == SCREEN_SALCHICHON || currentScreen == SCREEN_FUET) {
+      isRelevantScreen =
+        (buttonStates[i].btn == &btnMode) || (buttonStates[i].btn == &btnBack) || (buttonStates[i].btn == &btnVal1Minus) || (buttonStates[i].btn == &btnVal1Plus) || (buttonStates[i].btn == &btnVal2Minus) || (buttonStates[i].btn == &btnVal2Plus);
+    }
+
+
+    if (buttonStates[i].pressed && SAFE_MILLIS_DIFF(buttonStates[i].pressTime, now) >= PRESS_VISUAL_MS) {
+      // Всегда снимаем флаг pressed, чтобы ничего не "залипало"
+      buttonStates[i].pressed = false;
+
+      // А вот перерисовываем только на релевантных экранах
+      if (!isRelevantScreen) continue;
+
+      anyButtonUpdated = true;
+      if (buttonStates[i].btn == &btnMode) {
+        // ВАЖНО: перерисовываем btnMode согласно текущему экрану
+        switch (currentScreen) {
+          // Настройки нагрева/охлаждения/увлажнения — цикличная кнопка режима
+          case SCREEN_HEATER: drawModeButton(settings.heaterMode, false); break;
+          case SCREEN_COOLER: drawModeButton(settings.coolerMode, false); break;
+          case SCREEN_HUMID: drawModeButton(settings.humidMode, false); break;
+          case SCREEN_FAN: drawModeButton(settings.fanMode, false); break;
+          case SCREEN_SET_CLOCK:
+            drawButtonP(btnMode, S_SELECT, C565(255, 0, 0), 0xFFFF, true, false);
+            break;
+
+          // Экран стирания EEPROM — красная "СТЕРЕТЬ"
+          case SCREEN_EEPROM_WIPE:
+            drawButtonP(btnMode, S_EEPROM_WIPE_BTN, C565(255, 0, 0), 0xFFFF, true, false);
+            break;
+
+          // Экраны рецептов — "АКТИВНА/НЕАКТИВНА"
+          case SCREEN_KOPPA:
+            {
+              bool activeMine = (program.active && strcmp(currentProgramName, "КОППА") == 0);
+              drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                          activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+              break;
+            }
+          case SCREEN_HAMON:
+            {
+              bool activeMine = (program.active && strcmp(currentProgramName, "ХАМОН") == 0);
+              drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                          activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+              break;
+            }
+          case SCREEN_SALCHICHON:
+            {
+              bool activeMine = (program.active && strcmp(currentProgramName, "КОЛБАСА САЛЬЧИЧОН 55 ММ") == 0);
+              drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                          activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+              break;
+            }
+          case SCREEN_FUET:
+            {
+              bool activeMine = (program.active && strcmp(currentProgramName, "КОЛБАСА ФУЭТ 28 ММ") == 0);
+              drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                          activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+              break;
+            }
+
+          // Остальные экраны: ничего не делаем с btnMode (если он там не используется)
+          default:
+            break;
+        }
+      } else if (buttonStates[i].btn == &btnBack) {
+        drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+      } else if (buttonStates[i].btn == &btnVal1Minus || buttonStates[i].btn == &btnVal2Minus) {
+        drawButton(*buttonStates[i].btn, "-", C565(80, 80, 80), 0xFFFF, true, false);
+      } else if (buttonStates[i].btn == &btnVal1Plus || buttonStates[i].btn == &btnVal2Plus) {
+        drawButton(*buttonStates[i].btn, "+", C565(80, 80, 80), 0xFFFF, true, false);
+      }
+    }
+  }
+
+  // ДОБАВЛЕНО: если мы что‑то дорисовали на экране часов — сразу освежим мигающее поле
+  // чтобы сохранить текущую фазу blinkState (панель то есть, то «пустая»)
+  if (anyButtonUpdated && currentScreen == SCREEN_SET_CLOCK && selectedField != FIELD_NONE) {
+    drawFieldPanel(selectedField, true);  // isSelected=true → учтёт blinkState внутри
+    drawClockFace(false);
+  }
+  lastButtonUpdate = now;
+}
+
+// ======================================================================
+//            ЭКРАНЫ НАСТРОЕК: ЗАГОЛОВКИ, КНОПКИ, ПАНЕЛИ, FAN
+// ======================================================================
+
+void saveAndExitSettings() {
+  if (settingsDirty) saveSettings();
+
+  // Сброс состояния кнопок
+  for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+    buttonStates[i].pressed = false;
+    buttonStates[i].pressTime = 0;
+  }
+  // Сброс состояния сегментов
+  for (int i = 0; i < 4; i++) {
+    segs[i].pressed = false;
+    segs[i].pressTime = 0;
+  }
+  forceRedraw = false;
+  uiNeedsUpdate = false;
+  currentScreen = SCREEN_MAIN;
+  drawStaticLayout();
+}
+
+// Универсальная обработка экранов настроек (heater/cooler/humid/fan/calibration)
+void handleSettingsTouch(int x, int y, ScreenState screen) {
+  lastTouchTime = millis();
+  bool changedVal1 = false;
+  bool changedVal2 = false;
+  float* val1_ptr = nullptr;
+  float* val2_ptr = nullptr;
+  Mode3* mode_ptr = nullptr;
+  float step1 = STEP_TEMP, min1 = MIN_TEMP, max1 = MAX_TEMP;
+  float step2 = STEP_HYST, min2 = MIN_HYST, max2 = MAX_HYST_TEMP;
+  const char* label1_P = nullptr;
+  const char* label2_P = nullptr;
+  const char* unit1_P = nullptr;
+  const char* unit2_P = nullptr;
+
+  switch (screen) {
+    case SCREEN_HEATER:
+      val1_ptr = &settings.targetTemp;
+      val2_ptr = &settings.tempHeatHysteresis;
+      mode_ptr = &settings.heaterMode;
+      label1_P = S_TARGET;
+      label2_P = S_HYST;
+      unit1_P = S_UNIT_C;
+      unit2_P = S_UNIT_C;
+      step1 = STEP_TEMP;
+      min1 = MIN_TEMP;
+      max1 = MAX_TEMP;
+      step2 = STEP_HYST;
+      min2 = MIN_HYST;
+      max2 = MAX_HYST_TEMP;
+      break;
+
+    case SCREEN_COOLER:
+      val1_ptr = &settings.targetTemp;
+      val2_ptr = &settings.tempCoolHysteresis;
+      mode_ptr = &settings.coolerMode;
+      label1_P = S_TARGET;
+      label2_P = S_HYST;
+      unit1_P = S_UNIT_C;
+      unit2_P = S_UNIT_C;
+      step1 = STEP_TEMP;
+      min1 = MIN_TEMP;
+      max1 = MAX_TEMP;
+      step2 = STEP_HYST;
+      min2 = MIN_HYST;
+      max2 = MAX_HYST_TEMP;
+      break;
+
+    case SCREEN_HUMID:
+      val1_ptr = &settings.targetHum;
+      val2_ptr = &settings.humHysteresis;
+      mode_ptr = &settings.humidMode;
+      label1_P = S_TARGET;
+      label2_P = S_HYST;
+      unit1_P = S_UNIT_PCT;
+      unit2_P = S_UNIT_PCT;
+      step1 = STEP_HUM;
+      min1 = MIN_HUM;
+      max1 = MAX_HUM;
+      step2 = STEP_HYST;
+      min2 = MIN_HYST;
+      max2 = MAX_HYST_HUM;
+      break;
+
+    case SCREEN_CALIBRATION:
+      val1_ptr = &settings.tempBias;
+      val2_ptr = &settings.humBias;
+      label1_P = S_TEMP_OFFSET;
+      label2_P = S_HUM_OFFSET;
+      unit1_P = S_UNIT_C;
+      unit2_P = S_UNIT_PCT;
+      step1 = STEP_TEMP_BIAS;
+      min1 = MIN_TEMP_BIAS;
+      max1 = MAX_TEMP_BIAS;
+      step2 = STEP_HUM_BIAS;
+      min2 = MIN_HUM_BIAS;
+      max2 = MAX_HUM_BIAS;
+      break;
+
+    case SCREEN_FAN:
+      mode_ptr = &settings.fanMode;
+      label1_P = S_INTERVAL;
+      label2_P = S_DURATION;
+      unit1_P = S_UNIT_H;
+      unit2_P = S_UNIT_MIN;
+      step1 = STEP_FAN;
+      min1 = MIN_FAN;
+      max1 = MAX_FAN_INTERVAL;
+      step2 = STEP_FAN;
+      min2 = MIN_FAN;
+      max2 = MAX_FAN_DURATION;
+      break;
+
+    default: return;
+  }
+
+  static unsigned long lastActionTime = 0;
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+    if (inBtn(*buttonStates[i].btn, x, y)) {
+      beepClick();
+      buttonStates[i].pressed = true;
+      buttonStates[i].pressTime = millis();
+
+      if (buttonStates[i].btn == &btnBack) {
+        drawButtonP(*buttonStates[i].btn, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+        delay(SCREEN_DELAY_MS);
+        if (screen == SCREEN_CALIBRATION) {
+          if (settingsDirty) saveSettings();
+          for (int j = 0; j < NUM_BUTTON_STATES; j++) {
+            buttonStates[j].pressed = false;
+            buttonStates[j].pressTime = 0;
+          }
+          currentScreen = SCREEN_SYSTEM;
+          drawSystemScreen(true);
+        } else {
+          saveAndExitSettings();
+        }
+        return;
+      }
+
+      if (mode_ptr && buttonStates[i].btn == &btnMode) {
+        Mode3 oldMode = *mode_ptr;
+        int maxMode = (screen == SCREEN_FAN) ? 4 : 3;
+        *mode_ptr = (Mode3)((oldMode + 1) % maxMode);
+        settingsDirty = true;
+        if (screen == SCREEN_FAN) {
+          fanLastRunMs = millis();                                      // перезапускаем базу интервала (fallback)
+          fanLastRunUnix = rtcOk ? (uint32_t)rtc.now().unixtime() : 0;  // база интервала (RTC)
+        }
+        const char* m_P = S_ERROR;
+        switch (*mode_ptr) {
+          case MODE_AUTO: m_P = S_MODE_AUTO; break;
+          case MODE_ON: m_P = S_MODE_ON; break;
+          case MODE_OFF: m_P = S_MODE_OFF; break;
+          case MODE_TIMED: m_P = S_MODE_TIMED; break;
+          default: m_P = S_ERROR; break;
+        }
+        drawButtonP(*buttonStates[i].btn, m_P, C565(255, 0, 0), 0xFFFF, true, true);
+
+        if (screen == SCREEN_FAN) {
+          bool needsFull = (oldMode == MODE_TIMED) != (*mode_ptr == MODE_TIMED);
+          if (needsFull) {
+            uint16_t bgColor = C565(70, 82, 95);
+            tft.fillRect(10, 70, 460, 200, bgColor);
+            if (*mode_ptr == MODE_TIMED) {
+              drawButton(btnVal1Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+              drawButton(btnVal1Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+              drawButton(btnVal2Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+              drawButton(btnVal2Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+              uint16_t panelColor = LIGHT_GREEN_PANEL;
+              drawValueDisplay(SETTINGS_PANEL_Y1, S_INTERVAL, S_UNIT_H, settings.manualFanIntervalHours, panelColor);
+              drawValueDisplay(SETTINGS_PANEL_Y2, S_DURATION, S_UNIT_MIN, settings.manualFanDurationMinutes, panelColor);
+            } else {
+              clearFanVariableAreas();
+              drawFanStatusBox();
+              drawFanStatusText();
+            }
+          } else {
+            updateButtonVisuals();
+            if (*mode_ptr != MODE_TIMED) {
+              clearFanVariableAreas();
+              drawFanStatusBox();
+              drawFanStatusText();
+            }
+          }
+          return;
+        }
+      }
+
+      // +/- обработка для float полей
+      if (val1_ptr && buttonStates[i].btn == &btnVal1Minus) {
+        *val1_ptr -= step1;
+        changedVal1 = true;
+        drawButton(btnVal1Minus, "-", C565(80, 80, 80), 0xFFFF, true, true);
+      } else if (val1_ptr && buttonStates[i].btn == &btnVal1Plus) {
+        *val1_ptr += step1;
+        changedVal1 = true;
+        drawButton(btnVal1Plus, "+", C565(80, 80, 80), 0xFFFF, true, true);
+      } else if (val2_ptr && buttonStates[i].btn == &btnVal2Minus) {
+        *val2_ptr -= step2;
+        changedVal2 = true;
+        drawButton(btnVal2Minus, "-", C565(80, 80, 80), 0xFFFF, true, true);
+      } else if (val2_ptr && buttonStates[i].btn == &btnVal2Plus) {
+        *val2_ptr += step2;
+        changedVal2 = true;
+        drawButton(btnVal2Plus, "+", C565(80, 80, 80), 0xFFFF, true, true);
+      }
+
+      // FAN TIMED: целые uint16
+      if (screen == SCREEN_FAN && settings.fanMode == MODE_TIMED) {
+        int fanStep1 = (int)step1;
+        int fanStep2 = (int)step2;
+        if (buttonStates[i].btn == &btnVal1Minus && settings.manualFanIntervalHours > 0) {
+          settings.manualFanIntervalHours -= fanStep1;
+          changedVal1 = true;
+          drawButton(btnVal1Minus, "-", C565(80, 80, 80), 0xFFFF, true, true);
+        } else if (buttonStates[i].btn == &btnVal1Plus && settings.manualFanIntervalHours < 24) {
+          settings.manualFanIntervalHours += fanStep1;
+          changedVal1 = true;
+          drawButton(btnVal1Plus, "+", C565(80, 80, 80), 0xFFFF, true, true);
+        } else if (buttonStates[i].btn == &btnVal2Minus && settings.manualFanDurationMinutes > 0) {
+          settings.manualFanDurationMinutes -= fanStep2;
+          changedVal2 = true;
+          drawButton(btnVal2Minus, "-", C565(80, 80, 80), 0xFFFF, true, true);
+        } else if (buttonStates[i].btn == &btnVal2Plus && settings.manualFanDurationMinutes < 60) {
+          settings.manualFanDurationMinutes += fanStep2;
+          changedVal2 = true;
+          drawButton(btnVal2Plus, "+", C565(80, 80, 80), 0xFFFF, true, true);
+        }
+      }
+      break;
+    }
+  }
+
+
+  // === ВАЖНО: ОБРАБОТКА КНОПКИ PID ===
+  if (screen == SCREEN_HEATER && inBtn(btnPidParams, x, y)) {
+    beepClick();
+    currentScreen = SCREEN_PID;
+    forceRedraw = true;
+    drawPidScreen(true);
+    return;
+  }
+
+
+  if (val1_ptr) *val1_ptr = constrain(*val1_ptr, min1, max1);
+  if (val2_ptr) *val2_ptr = constrain(*val2_ptr, min2, max2);
+  if (changedVal1 || changedVal2) {
+    settingsDirty = true;
+    uint16_t pc = LIGHT_GREEN_PANEL;
+    if (changedVal1) drawValueDisplay(SETTINGS_PANEL_Y1, label1_P, unit1_P, *val1_ptr, pc);
+    if (changedVal2) drawValueDisplay(SETTINGS_PANEL_Y2, label2_P, unit2_P, *val2_ptr, pc);
+  }
+  updateButtonVisuals();
+  uiNeedsUpdate = false;
+  forceRedraw = false;
+}
+// --- ЗАМЕНИТЬ полностью drawSettingsHeader ---
+void drawSettingsHeader(const char* title_P, bool hasHysteresis) {
+  tft.fillScreen(C565(70, 82, 95));
+  drawBackground();
+  DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+  drawStatusBar(true, now_dt);
+
+  tft.loadFont(RotondaBold20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  strcpy_P(g_char_buffer, title_P);
+  int text_width = tft.textWidth(g_char_buffer);
+  int text_x = (tft.width() - text_width) / 2;
+  tft.drawString(g_char_buffer, text_x, SETTINGS_HEADER_Y);
+  tft.unloadFont();
+
+  drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+  delay(SCREEN_DELAY_MS);
+
+  if (hasHysteresis) {
+    Mode3 mode = (currentScreen == SCREEN_HEATER)   ? settings.heaterMode
+                 : (currentScreen == SCREEN_COOLER) ? settings.coolerMode
+                                                    : settings.humidMode;
+    drawModeButton(mode, false);
+
+    drawButton(btnVal1Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+    drawButton(btnVal1Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+    drawButton(btnVal2Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+    drawButton(btnVal2Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+  } else if (currentScreen == SCREEN_FAN) {
+    drawModeButton(settings.fanMode, false);
+  }
+}
+
+
+void drawValueDisplay(int y, const char* label_P, const char* unit_P, float value, uint16_t panelColor) {
+  (void)panelColor;
+  int box_x = SETTINGS_PANEL_X;
+  int box_y = y;
+  int box_w = SETTINGS_PANEL_W;
+  int box_h = SETTINGS_PANEL_H;
+
+  uint16_t panelFill = C565(144, 238, 144);
+  tft.fillRect(box_x, box_y, box_w, box_h, panelFill);
+
+  char number_buffer[16];
+  char unit_buffer[8];
+
+  // Включаем "знак +" только для экранов калибровки (смещения),
+  // а на уставках/гистерезисах/таймерах знаки "+" не показываем.
+  bool signedMode = (label_P == S_TEMP_OFFSET) || (label_P == S_HUM_OFFSET);
+
+  if (signedMode) {
+    // Для смещений оставляем «+» для положительных, «-» для отрицательных, 0 — без знака
+    if (fabs(value) < 0.05f) {
+      strcpy(number_buffer, "0");
+    } else {
+      char tmp[16];
+      dtostrf(value, 0, 1, tmp);  // формат с 1 знаком после запятой
+      if (value > 0.0f) {
+        snprintf(number_buffer, sizeof(number_buffer), "+%s", tmp);
+      } else {
+        strncpy(number_buffer, tmp, sizeof(number_buffer));
+        number_buffer[sizeof(number_buffer) - 1] = '\0';
+      }
+    }
+  } else {
+    // Для обычных полей (цели, гистерезисы, таймеры) — без принудительного «+»
+    dtostrf(value, 0, 1, number_buffer);
+  }
+
+  // ✅ ИСПРАВЛЕНО: всегда корректно копируем единицы из PROGMEM
+  unit_buffer[0] = '\0';
+  if (unit_P != nullptr) {
+    strcpy_P(unit_buffer, unit_P);
+  }
+
+  tft.setFreeFont(&FreeSansBold18pt7b);
+  tft.setTextSize(0.7);
+  tft.setTextColor(currentScreen == SCREEN_SET_CLOCK ? TFT_WHITE : TCache.txtMain);
+  int number_width = tft.textWidth(number_buffer);
+  int number_height = tft.fontHeight();
+
+  int unit_width = 0;
+  int unit_height = 0;
+  if (unit_buffer[0] != '\0') {
+    tft.setFreeFont(&FreeSans12pt7b);
+    tft.setTextSize(1);
+    unit_width = tft.textWidth(unit_buffer);
+    unit_height = tft.fontHeight();
+  }
+
+  int total_width = number_width + (unit_buffer[0] != '\0' ? unit_width + 4 : 0);
+  int max_height = max(number_height, unit_height);
+
+  // ✅ ИСПРАВЛЕНО: правильная вертикальная центровка
+  int vx = box_x + (box_w - total_width) / 2;
+  int vy = box_y + (box_h - max_height) / 2 + max_height / 2 + 10;
+
+  tft.setFreeFont(&FreeSansBold18pt7b);
+  tft.setTextSize(0.7);
+  tft.setCursor(vx, vy);
+  tft.print(number_buffer);
+
+  // ✅ ИСПРАВЛЕНО: единицы измерения всегда выводятся
+  if (unit_buffer[0] != '\0') {
+    tft.setFreeFont(&FreeSans12pt7b);
+    tft.setTextSize(1);
+    tft.setCursor(vx + number_width + 4, vy);
+    tft.print(unit_buffer);
+  }
+
+  tft.loadFont(RotondaBold20);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  strcpy_P(g_char_buffer, label_P);
+  int label_width = tft.textWidth(g_char_buffer);
+  int label_x = box_x + (box_w - label_width) / 2;
+  int label_y = box_y - SETTINGS_LABEL_OFFSET;
+  tft.drawString(g_char_buffer, label_x, label_y);
+  tft.unloadFont();
+}
+
+
+
+// ---------------- Конкретные экраны настроек ----------------
+void drawHeaterSettingsScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+    drawSettingsHeader(S_HEATER, true);
+    uint16_t pc = LIGHT_GREEN_PANEL;
+    drawValueDisplay(SETTINGS_PANEL_Y1, S_TARGET, S_UNIT_C, settings.targetTemp, pc);
+    drawValueDisplay(SETTINGS_PANEL_Y2, S_HYST, S_UNIT_C, settings.tempHeatHysteresis, pc);
+    drawButtonP(btnPidParams, S_PID_PARAMS, TCache.panelBorder, TCache.panelBorder, true, false);
+    forceRedraw = false;
+  }
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+
+// ======================================================================
+//                            PID SCREEN (UI)
+// ======================================================================
+
+// Рисует экран PID
+
+void drawPidScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    // сброс визуальных нажатий
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+
+    // Заголовок + BACK
+    drawSettingsHeader(S_PID_PARAMS, false);
+
+    // PID ON/OFF
+    if (settings.pidEnabled) {
+      drawButtonP(btnPidToggle, S_PID_ON, C565(255, 0, 0), 0xFFFF, true, false);
+    } else {
+      drawButtonP(btnPidToggle, S_PID_OFF, C565(60, 60, 60), 0xFFFF, true, false);
+    }
+
+    // AUTOTUNE + ABORT
+    if (settings.pidEnabled) {
+      if (atState == AT_RUNNING) {
+        drawButton(btnPidAutotune, "В ПРОЦЕССЕ", C565(60, 60, 60), 0xFFFF, false, false);
+        drawButton(btnPidAbort, "ОТМЕНА", C565(180, 0, 0), 0xFFFF, true, false);
+      } else {
+        drawButtonP(btnPidAutotune, S_PID_AUTOTUNE, C565(0, 80, 0), 0xFFFF, true, false);
+        uint16_t bg = C565(70, 82, 95);
+        tft.fillRect(btnPidAbort.x, btnPidAbort.y, btnPidAbort.w, btnPidAbort.h, bg);
+      }
+    } else {
+      uint16_t bg = C565(70, 82, 95);
+      tft.fillRect(btnPidAutotune.x, btnPidAutotune.y, btnPidAutotune.w, btnPidAutotune.h, bg);
+      tft.fillRect(btnPidAbort.x, btnPidAbort.y, btnPidAbort.w, btnPidAbort.h, bg);
+    }
+
+    forceRedraw = false;
+  }
+
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+
+  // Нижний блок статуса
+  {
+    uint16_t bg = C565(70, 82, 95);
+
+    const int x = 20;
+    const int y = 235;
+    const int w = 440;
+    const int h = 75;
+
+    tft.fillRect(x, y, w, h, bg);
+
+    tft.loadFont(RotondaBold20);
+    tft.setTextSize(1);
+    tft.setTextDatum(TL_DATUM);
+
+    if (atState == AT_RUNNING) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "Прогресс: %u%%", (unsigned)atProgress);
+      tft.setTextColor(TFT_WHITE, bg);
+      tft.drawString(buf, x, y);
+
+      // Температура + SP autotune (15C)
+      float t = currentTemp + settings.tempBias;
+      char tS[16];
+      dtostrf(t, 0, 1, tS);
+      char spS[16];
+      dtostrf(atSetpoint, 0, 1, spS);
+
+      char line2[64];
+      snprintf(line2, sizeof(line2), "T=%sC  SP=%sC", tS, spS);
+      tft.setTextColor(C565(200, 200, 200), bg);
+      tft.drawString(line2, x, y + 25);
+
+      // Покажем band (полезно при авто-подстройке)
+      char line3[48];
+      char bandS[16];
+      dtostrf(atNoiseBand, 0, 1, bandS);
+      snprintf(line3, sizeof(line3), "band=±%sC  cycles=%u", bandS, (unsigned)atCycles);
+      tft.drawString(line3, x, y + 50);
+
+    } else if (atState == AT_DONE) {
+      strcpy_P(g_char_buffer, S_PID_DONE);
+      tft.setTextColor(C565(0, 220, 0), bg);
+      tft.drawString(g_char_buffer, x, y);
+
+      char kpS[16], kiS[16], kdS[16];
+      dtostrf(settings.pidKp, 0, 3, kpS);
+      dtostrf(settings.pidKi, 0, 3, kiS);
+      dtostrf(settings.pidKd, 0, 3, kdS);
+
+      char gains[96];
+      snprintf(gains, sizeof(gains), "Kp=%s  Ki=%s  Kd=%s", kpS, kiS, kdS);
+      tft.setTextColor(TFT_WHITE, bg);
+      tft.drawString(gains, x, y + 25);
+
+      tft.setTextColor(C565(200, 200, 200), bg);
+      tft.drawString("Сохранено в EEPROM", x, y + 50);
+
+    } else if (atState == AT_ABORT) {
+      tft.setTextColor(C565(255, 180, 0), bg);
+      tft.drawString("АВТОТЮНИНГ ОТМЕНЕН", x, y);
+    }
+
+    tft.unloadFont();
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(0);
+    tft.setTextSize(1);
+  }
+}
+
+
+
+
+
+
+void drawCoolerSettingsScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+    drawSettingsHeader(S_COOLER, true);
+    uint16_t pc = LIGHT_GREEN_PANEL;
+    drawValueDisplay(SETTINGS_PANEL_Y1, S_TARGET, S_UNIT_C, settings.targetTemp, pc);
+    drawValueDisplay(SETTINGS_PANEL_Y2, S_HYST, S_UNIT_C, settings.tempCoolHysteresis, pc);
+  }
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+void drawHumidSettingsScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+    drawSettingsHeader(S_HUMIDIFIER, true);
+    uint16_t pc = LIGHT_GREEN_PANEL;
+    drawValueDisplay(SETTINGS_PANEL_Y1, S_TARGET, S_UNIT_PCT, settings.targetHum, pc);
+    drawValueDisplay(SETTINGS_PANEL_Y2, S_HYST, S_UNIT_PCT, settings.humHysteresis, pc);
+  }
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+// ---------------- FAN экраны ----------------
+void clearFanVariableAreas() {
+  uint16_t bgColor = C565(70, 82, 95);
+  tft.fillRect(SETTINGS_PANEL_X, SETTINGS_PANEL_Y1, SETTINGS_PANEL_W, SETTINGS_PANEL_H, bgColor);
+  tft.fillRect(SETTINGS_PANEL_X, SETTINGS_PANEL_Y2, SETTINGS_PANEL_W, SETTINGS_PANEL_H, bgColor);
+  tft.fillRect(SETTINGS_BTN_MINUS_X, SETTINGS_BTN_Y1, SETTINGS_BTN_W, SETTINGS_BTN_H, bgColor);
+  tft.fillRect(SETTINGS_BTN_MINUS_X, SETTINGS_BTN_Y2, SETTINGS_BTN_W, SETTINGS_BTN_H, bgColor);
+  tft.fillRect(SETTINGS_BTN_PLUS_X, SETTINGS_BTN_Y1, SETTINGS_BTN_W, SETTINGS_BTN_H, bgColor);
+  tft.fillRect(SETTINGS_BTN_PLUS_X, SETTINGS_BTN_Y2, SETTINGS_BTN_W, SETTINGS_BTN_H, bgColor);
+}
+
+void drawFanStatusBox() {
+  uint16_t darkGrayTop = C565(80, 80, 80);
+  uint16_t darkGrayBottom = C565(50, 50, 50);
+  int boxX = (tft.width() - 350) / 2;
+  int boxY = (tft.height() - 50) / 2;
+  int boxW = 350;
+  int boxH = 50;
+  int boxR = 8;
+  drawVerticalGradientRounded(boxX, boxY, boxW, boxH, boxR, darkGrayTop, darkGrayBottom, 2, true, TCache.shadowColor, 0xFFFF, false);
+}
+void drawFanStatusText() {
+  int boxX = (tft.width() - 350) / 2;
+  int boxY = (tft.height() - 50) / 2;
+  int boxW = 350;
+  int boxH = 50;
+
+  tft.loadFont(RotondaBold20);
+  tft.setTextSize(1);
+
+  // Текст метки
+  strcpy_P(g_char_buffer, S_FAN_STATUS_LABEL);
+  int labelWidth = tft.textWidth(g_char_buffer);
+
+  // Текст статуса (АВТО/ВКЛ/ВЫКЛ)
+  const char* status_P = S_ERROR;
+  switch (settings.fanMode) {
+    case MODE_AUTO: status_P = S_MODE_AUTO; break;
+    case MODE_ON: status_P = S_MODE_ON; break;
+    case MODE_OFF: status_P = S_MODE_OFF; break;
+    default: status_P = S_ERROR; break;
+  }
+  char status_buf[24];
+  strcpy_P(status_buf, status_P);
+  int statusWidth = tft.textWidth(status_buf);
+
+  // Расстояние между меткой и статусом — можно подбирать (8 пикселей обычно хорошо)
+  const int gap = 8;
+
+  // Центрируем весь блок (label + gap + status) внутри box по горизонтали
+  int totalWidth = labelWidth + gap + statusWidth;
+  int tx = boxX + (boxW - totalWidth) / 2;
+
+  // Вертикальная центровка: используем высоту шрифта
+  int fh = tft.fontHeight();
+  int ty = boxY + (boxH - fh) / 2;  // TL_DATUM — y будет верхом текста
+
+  // Нарисовать: сначала метку (белым), затем статус (цветом alert)
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(g_char_buffer, tx, ty);
+
+  tft.setTextColor(TCache.alertColor, TFT_BLACK);
+  tft.drawString(status_buf, tx + labelWidth + gap, ty);
+
+  tft.unloadFont();
+}
+
+
+
+
+void drawFanSettingsScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+    drawSettingsHeader(S_FAN_FULL, false);
+    if (settings.fanMode == MODE_TIMED) {
+      drawButton(btnVal1Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+      drawButton(btnVal1Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+      drawButton(btnVal2Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+      drawButton(btnVal2Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+      uint16_t pc = LIGHT_GREEN_PANEL;
+      // ✅ ИСПРАВЛЕНО: приведение типа к float
+      drawValueDisplay(SETTINGS_PANEL_Y1, S_INTERVAL, S_UNIT_H, (float)settings.manualFanIntervalHours, pc);
+      drawValueDisplay(SETTINGS_PANEL_Y2, S_DURATION, S_UNIT_MIN, (float)settings.manualFanDurationMinutes, pc);
+    } else {
+      clearFanVariableAreas();
+      drawFanStatusBox();
+      drawFanStatusText();
+    }
+  }
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+// ======================================================================
+//                         Экран СИСТЕМА
+// ======================================================================
+
+
+void drawSystemScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    // Сброс состояний кнопок
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+
+    // Очистка экрана и фон
+    tft.fillScreen(TFT_BLACK);
+    drawBackground();
+
+    // Статус-бар
+    DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+    drawStatusBar(true, now_dt);
+
+    // Заголовок "СИСТЕМА"
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_SYSTEM);
+    int text_width = tft.textWidth(g_char_buffer);
+    int text_x = (tft.width() - text_width) / 2;
+    tft.drawString(g_char_buffer, text_x, SETTINGS_HEADER_Y);
+    tft.unloadFont();
+
+    // Цвета кнопок
+    uint16_t darkGray = C565(50, 50, 50);
+    uint16_t top = lighten565(darkGray, 0.1f);
+    uint16_t bot = darken565(darkGray, 0.2f);
+
+    // НОВАЯ ГЕОМЕТРИЯ: 4 более низкие кнопки
+    int btnW = SYSTEM_BTN_WIDTH;
+    int btnH = 40;  // было 50 — делаем ниже
+    int btnX = (tft.width() - btnW) / 2;
+    int y1 = 62;             // КАЛИБРОВКА
+    int y2 = y1 + btnH + 8;  // EEPROM
+    int y3 = y2 + btnH + 8;  // УСТАНОВКА ЧАСОВ
+    int y4 = y3 + btnH + 8;  // БИПЕР
+
+    btnSystemCalibrate = { btnX, y1, btnW, btnH };
+    btnSystemEEPROM = { btnX, y2, btnW, btnH };
+    btnSystemClock = { btnX, y3, btnW, btnH };
+    btnSystemBeeper = { btnX, y4, btnW, btnH };
+
+    // КАЛИБРОВКА
+    drawVerticalGradientRounded(btnSystemCalibrate.x, btnSystemCalibrate.y,
+                                btnSystemCalibrate.w, btnSystemCalibrate.h,
+                                8, top, bot, 3, true, TCache.shadowColor, 0xFFFF, false);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_CALIBRATION);
+    text_width = tft.textWidth(g_char_buffer);
+    tft.drawString(g_char_buffer,
+                   btnSystemCalibrate.x + (btnSystemCalibrate.w - text_width) / 2,
+                   btnSystemCalibrate.y + (btnSystemCalibrate.h - tft.fontHeight()) / 2);
+    tft.unloadFont();
+
+    // СТИРАНИЕ EEPROM
+    drawVerticalGradientRounded(btnSystemEEPROM.x, btnSystemEEPROM.y,
+                                btnSystemEEPROM.w, btnSystemEEPROM.h,
+                                8, top, bot, 3, true, TCache.shadowColor, 0xFFFF, false);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_EEPROM_WIPE);
+    text_width = tft.textWidth(g_char_buffer);
+    tft.drawString(g_char_buffer,
+                   btnSystemEEPROM.x + (btnSystemEEPROM.w - text_width) / 2,
+                   btnSystemEEPROM.y + (btnSystemEEPROM.h - tft.fontHeight()) / 2);
+    tft.unloadFont();
+
+    // УСТАНОВКА ЧАСОВ
+    drawVerticalGradientRounded(btnSystemClock.x, btnSystemClock.y,
+                                btnSystemClock.w, btnSystemClock.h,
+                                8, top, bot, 3, true, TCache.shadowColor, 0xFFFF, false);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_SET_CLOCK);
+    text_width = tft.textWidth(g_char_buffer);
+    tft.drawString(g_char_buffer,
+                   btnSystemClock.x + (btnSystemClock.w - text_width) / 2,
+                   btnSystemClock.y + (btnSystemClock.h - tft.fontHeight()) / 2);
+    tft.unloadFont();
+
+    // НОВАЯ КНОПКА БИПЕРА
+    uint16_t fillOn = C565(0, 80, 0);    // тёмно-зелёный (как BACK)
+    uint16_t fillOff = C565(120, 0, 0);  // красный
+
+    const char* label_P = settings.beeperEnabled ? S_BEEPER_ON : S_BEEPER_OFF;
+    uint16_t fill = settings.beeperEnabled ? fillOn : fillOff;
+
+    drawButtonP(btnSystemBeeper, label_P, fill, 0xFFFF, true, false);
+
+    // Назад
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+    delay(SCREEN_DELAY_MS);
+  }
+
+
+  // Обновление статус-бара
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+
+
+
+
+// ======================================================================
+//                          SYSTEM TOUCH
+// ======================================================================
+// === ЗАМЕНИТЬ ПОЛНОСТЬЮ: handleSystemTouch(int x, int y) ===
+void handleSystemTouch(int x, int y) {
+  if (currentScreen != SCREEN_SYSTEM) return;
+  lastTouchTime = millis();
+
+  // Антидребезг
+  static unsigned long lastActionTime = 0;
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  // Цвета экрана "СИСТЕМА"
+  uint16_t darkGray = C565(50, 50, 50);
+  uint16_t top = lighten565(darkGray, 0.1f);
+  uint16_t bot = darken565(darkGray, 0.2f);
+
+  auto pressDelay = []() {
+    delay(SCREEN_DELAY_MS);
+  };
+
+  // КАЛИБРОВКА — pressed-визуал (затемнение + утопление), затем переход
+  if (inBtn(btnSystemCalibrate, x, y)) {
+    beepClick();
+    uint16_t pTop = darken565(top, 0.5f), pBot = darken565(bot, 0.5f);
+    uint16_t pMid = lerp565(pTop, pBot, 0.5f);
+    drawVerticalGradientRounded(btnSystemCalibrate.x, btnSystemCalibrate.y,
+                                btnSystemCalibrate.w, btnSystemCalibrate.h,
+                                8, pTop, pBot, 1, true, TCache.shadowColor, 0xFFFF, true);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, pMid);
+    tft.setTextDatum(MC_DATUM);
+    strcpy_P(g_char_buffer, S_CALIBRATION);
+    tft.drawString(g_char_buffer,
+                   btnSystemCalibrate.x + btnSystemCalibrate.w / 2,
+                   btnSystemCalibrate.y + btnSystemCalibrate.h / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+    tft.unloadFont();
+
+    pressDelay();
+    currentScreen = SCREEN_CALIBRATION;
+    drawCalibrationScreen(true);
+    return;
+  }
+
+  // СТИРАНИЕ EEPROM — pressed-визуал, затем переход на экран стирания
+  if (inBtn(btnSystemEEPROM, x, y)) {
+    beepClick();
+    uint16_t pTop = darken565(top, 0.5f), pBot = darken565(bot, 0.5f);
+    uint16_t pMid = lerp565(pTop, pBot, 0.5f);
+    drawVerticalGradientRounded(btnSystemEEPROM.x, btnSystemEEPROM.y,
+                                btnSystemEEPROM.w, btnSystemEEPROM.h,
+                                8, pTop, pBot, 1, true, TCache.shadowColor, 0xFFFF, true);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, pMid);
+    tft.setTextDatum(MC_DATUM);
+    strcpy_P(g_char_buffer, S_EEPROM_WIPE);
+    tft.drawString(g_char_buffer,
+                   btnSystemEEPROM.x + btnSystemEEPROM.w / 2,
+                   btnSystemEEPROM.y + btnSystemEEPROM.h / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+    tft.unloadFont();
+
+    pressDelay();
+    currentScreen = SCREEN_EEPROM_WIPE;
+    drawEepromWipeScreen(true);
+    return;
+  }
+
+  // УСТАНОВКА ЧАСОВ — pressed-визуал, затем переход
+  if (inBtn(btnSystemClock, x, y)) {
+    beepClick();
+    uint16_t pTop = darken565(top, 0.5f), pBot = darken565(bot, 0.5f);
+    uint16_t pMid = lerp565(pTop, pBot, 0.5f);
+    drawVerticalGradientRounded(btnSystemClock.x, btnSystemClock.y,
+                                btnSystemClock.w, btnSystemClock.h,
+                                8, pTop, pBot, 1, true, TCache.shadowColor, 0xFFFF, true);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, pMid);
+    tft.setTextDatum(MC_DATUM);
+    strcpy_P(g_char_buffer, S_SET_CLOCK);
+    tft.drawString(g_char_buffer,
+                   btnSystemClock.x + btnSystemClock.w / 2,
+                   btnSystemClock.y + btnSystemClock.h / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+    tft.unloadFont();
+
+    pressDelay();
+    currentScreen = SCREEN_SET_CLOCK;
+    drawSetClockScreen(true);
+    return;
+  }
+  if (inBtn(btnSystemBeeper, x, y)) {
+    beepClick();
+    settings.beeperEnabled = !settings.beeperEnabled;
+    settingsDirty = true;
+    saveSettings();
+
+    if (!settings.beeperEnabled) {
+      beeperState = false;
+      digitalWrite(BUZZER_PIN, HIGH);
+    }
+
+    uint16_t fillOn = C565(0, 80, 0);
+    uint16_t fillOff = C565(120, 0, 0);
+    const char* label_P = settings.beeperEnabled ? S_BEEPER_ON : S_BEEPER_OFF;
+    uint16_t fill = settings.beeperEnabled ? fillOn : fillOff;
+
+    drawButtonP(btnSystemBeeper, label_P, fill, 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    drawButtonP(btnSystemBeeper, label_P, fill, 0xFFFF, true, false);
+
+    // Обновляем статус‑бар ПРЯМО на экране СИСТЕМА
+    DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+    updateStatusBar(now_dt);
+
+    return;
+  }
+
+
+
+  // НАЗАД
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_SETTINGS_HUB;
+    drawSettingsHubScreen(true);
+    return;
+  }
+}
+
+
+// ======================================================================
+//                          SET CLOCK UI
+// ======================================================================
+// 10) Расширяем drawFieldPanel — рисуем панель часового пояса по центру
+void drawFieldPanel(SelectedField field, bool isSelected) {
+  if (field == FIELD_NONE) return;
+
+  int leftX = 35, rightX = 365, yStart = 65, spacing = 50;
+  uint16_t panelColor = C565(0, 100, 0), bgColor = C565(70, 82, 95);
+  uint16_t panelW = 80, panelH = 30, panelR = 5;
+
+  uint16_t panelTop = lighten565(panelColor, 0.1f);
+  uint16_t panelBottom = darken565(panelColor, 0.2f);
+
+  int panelX = 0, panelY = 0;
+  const char* format = "";
+  int value = 0;
+
+  switch (field) {
+    case FIELD_YEAR:
+      panelX = leftX;
+      panelY = yStart;
+      format = "%04d";
+      value = currentYear;
+      break;
+    case FIELD_MONTH:
+      panelX = leftX;
+      panelY = yStart + spacing;
+      format = "%02d";
+      value = currentMonth;
+      break;
+    case FIELD_DAY:
+      panelX = leftX;
+      panelY = yStart + spacing * 2;
+      format = "%02d";
+      value = currentDay;
+      break;
+    case FIELD_HOUR:
+      panelX = rightX;
+      panelY = yStart;
+      format = "%02d";
+      value = currentHour;
+      break;
+    case FIELD_MINUTE:
+      panelX = rightX;
+      panelY = yStart + spacing;
+      format = "%02d";
+      value = currentMinute;
+      break;
+    case FIELD_SECOND:
+      panelX = rightX;
+      panelY = yStart + spacing * 2;
+      format = "%02d";
+      value = currentSecond;
+      break;
+
+    case FIELD_TZ:
+      {
+        // Центр экрана, под часами, над кнопкой "НАЗАД"
+        panelW = 100;  // <-- стало шире
+        panelX = (tft.width() - panelW) / 2;
+        panelY = 230;
+        // Зачищаем подложку
+        tft.fillRect(panelX - 5, panelY - 5, panelW + 10, panelH + 10, bgColor);
+        if (!isSelected || (isSelected && !blinkState)) {
+          drawVerticalGradientRounded(panelX, panelY, panelW, panelH, panelR, panelTop, panelBottom, 2, true, TCache.shadowColor, 0xFFFF, false);
+
+          // Формируем строку "UTC+X" или "UTC-X"
+          char tzStr[16];
+          int tz = settings.tzOffsetHours;
+          if (tz >= 0) snprintf(tzStr, sizeof(tzStr), "UTC+%d", tz);
+          else snprintf(tzStr, sizeof(tzStr), "UTC%d", tz);  // tz уже отрицательный
+
+          tft.setFreeFont(&FreeSansBold12pt7b);
+          tft.setTextColor(TFT_WHITE);
+          int text_w = tft.textWidth(tzStr);
+          int font_h = tft.fontHeight();
+          int num_x = panelX + (panelW - text_w) / 2;
+          int num_y = panelY + (panelH - font_h) / 2 + font_h / 2 + 8;
+          tft.setCursor(num_x, num_y);
+          tft.print(tzStr);
+          tft.setFreeFont(NULL);
+        }
+        return;
+      }
+
+    default: return;
+  }
+
+  // Обычные поля (год/месяц/день/часы/мин/сек)
+  tft.fillRect(panelX - 5, panelY - 5, panelW + 10, panelH + 10, bgColor);
+  if (!isSelected || (isSelected && !blinkState)) {
+    drawVerticalGradientRounded(panelX, panelY, panelW, panelH, panelR, panelTop, panelBottom, 2, true, TCache.shadowColor, 0xFFFF, false);
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextColor(TFT_WHITE);
+    sprintf(g_char_buffer, format, value);
+    int text_w = tft.textWidth(g_char_buffer);
+    int font_h = tft.fontHeight();
+    int num_x = panelX + (panelW - text_w) / 2;
+    int num_y = panelY + (panelH - font_h) / 2 + font_h / 2 + 8;
+    tft.setCursor(num_x, num_y);
+    tft.print(g_char_buffer);
+    tft.setFreeFont(NULL);
+  }
+}
+
+// === МЕНЯЕМ РАЗМЕР И ПОЗИЦИЮ ЧАСОВ ==
+
+// 1) Уменьшаем ещё на 30% (от 70% к 70% → ~49%), и располагаем между "ВЫБОР" и "ЧАСОВОЙ ПОЯС"
+void drawClockFace(bool fullRedraw) {
+  const float S = 0.49f;  // было 0.7f; теперь ~вдвое меньше исходного (70% * 70%)
+  const int centerX = 235;
+
+  const int centerY = 150;
+
+  const int radius = (int)(70 * S);            // ~34
+  const int hourHandLength = (int)(40 * S);    // ~19
+  const int minuteHandLength = (int)(55 * S);  // ~27
+  const float rotationAngle = -45 * PI / 180;
+
+  if (fullRedraw) {
+    tft.fillCircle(centerX, centerY, radius, TFT_BLACK);
+    tft.drawCircle(centerX, centerY, radius, TFT_WHITE);
+    tft.drawCircle(centerX, centerY, radius - 1, TFT_WHITE);
+    for (int i = 0; i < 4; i++) {
+      float angle = i * PI / 2.0 + rotationAngle;
+      int x1 = centerX + cos(angle) * (radius - 5);
+      int y1 = centerY + sin(angle) * (radius - 5);
+      int x2 = centerX + cos(angle) * (radius - 10);
+      int y2 = centerY + sin(angle) * (radius - 10);
+      tft.drawLine(x1, y1, x2, y2, TFT_WHITE);
+    }
+  } else {
+    tft.fillCircle(centerX, centerY, radius - 5, TFT_BLACK);
+  }
+
+  float hourAngle = ((currentHour % 12) + currentMinute / 60.0) * 30 * PI / 180 + rotationAngle;
+  float minuteAngle = currentMinute * 6 * PI / 180 + rotationAngle;
+
+  int hourX = centerX + cos(hourAngle) * hourHandLength;
+  int hourY = centerY + sin(hourAngle) * hourHandLength;
+  tft.drawLine(centerX, centerY, hourX, hourY, TFT_WHITE);
+  tft.drawLine(centerX - 1, centerY, hourX - 1, hourY, TFT_WHITE);
+  tft.drawLine(centerX + 1, centerY, hourX + 1, hourY, TFT_WHITE);
+
+  int minuteX = centerX + cos(minuteAngle) * minuteHandLength;
+  int minuteY = centerY + sin(minuteAngle) * minuteHandLength;
+  tft.drawLine(centerX, centerY, minuteX, minuteY, C565(0, 255, 0));
+  tft.drawLine(centerX - 1, centerY, minuteX - 1, minuteY, C565(0, 255, 0));
+
+  tft.fillCircle(centerX, centerY, 3, TFT_WHITE);
+}
+
+
+// 11) Рисуем подпись "ЧАСОВОЙ ПОЯС" и саму панель на экране SET_CLOCK
+// === ДОПОЛНЯЕМ drawSetClockScreen: фиксируем TZ на входе, сбрасываем флаг редактирования ===
+void drawSetClockScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+
+    // Новое: запоминаем TZ при входе, сбрасываем флаги
+    tzOnEntry = settings.tzOffsetHours;
+    timeFieldsDirty = false;
+    selectedField = FIELD_NONE;
+
+    tft.fillScreen(C565(70, 82, 95));
+    DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+    if (rtcOk && now_dt.year() >= 2025 && now_dt.year() <= 2099) {
+      currentYear = now_dt.year();
+      currentMonth = now_dt.month();
+      currentDay = now_dt.day();
+      currentHour = now_dt.hour();
+      currentMinute = now_dt.minute();
+      currentSecond = now_dt.second();
+    }
+    drawStatusBar(true, now_dt);
+
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, C565(70, 82, 95));
+    strcpy_P(g_char_buffer, S_SET_CLOCK);
+    tft.drawString(g_char_buffer, (tft.width() - tft.textWidth(g_char_buffer)) / 2, 40);
+    tft.unloadFont();
+
+    drawButtonP(btnMode, S_SELECT, C565(255, 0, 0), 0xFFFF, true, false);
+    drawButton(btnVal2Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+    drawButton(btnVal2Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+    delay(SCREEN_DELAY_MS);
+
+    // Подписи слева/справа
+    drawClockLabels();
+
+    // Панели значений слева/справа
+    drawFieldPanel(FIELD_YEAR, false);
+    drawFieldPanel(FIELD_MONTH, false);
+    drawFieldPanel(FIELD_DAY, false);
+    drawFieldPanel(FIELD_HOUR, false);
+    drawFieldPanel(FIELD_MINUTE, false);
+    drawFieldPanel(FIELD_SECOND, false);
+
+    // Аналоговые часы — ещё меньше и аккуратно между "ВЫБОР" и "ЧАСОВОЙ ПОЯС"
+    drawClockFace(true);
+
+    // ПОДПИСЬ "ЧАСОВОЙ ПОЯС"
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, C565(70, 82, 95));
+    strcpy_P(g_char_buffer, S_TIMEZONE);
+    int labelW = tft.textWidth(g_char_buffer);
+    int labelX = (tft.width() - labelW) / 2;
+    int labelY = 200;  // над панелью TZ
+    tft.drawString(g_char_buffer, labelX, labelY);
+    tft.unloadFont();
+
+    // Панель TZ под часами
+    drawFieldPanel(FIELD_TZ, false);
+
+  } else {
+    if (selectedField != FIELD_NONE) {
+      drawFieldPanel(selectedField, true);
+    }
+    drawClockFace(false);
+  }
+}
+
+// === ДОПОЛНЯЕМ handleSetClockTouch: отмечаем редактирование времени, сдвигаем RTC при смене TZ ===
+void handleSetClockTouch(int x, int y) {
+
+  if (currentScreen != SCREEN_SET_CLOCK) return;
+  lastTouchTime = millis();
+  static unsigned long lastAction = 0;
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastAction, now) < TOUCH_DEBOUNCE_MS) return;
+  lastAction = now;
+
+  bool redraw = false;
+  for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+    if (!inBtn(*buttonStates[i].btn, x, y)) continue;
+    beepClick();
+    buttonStates[i].pressed = true;
+    buttonStates[i].pressTime = now;
+
+    if (buttonStates[i].btn == &btnMode) {
+      SelectedField prev = selectedField;
+      // Цикл по всем полям: YEAR→...→SECOND→TZ→YEAR→...
+      selectedField = (SelectedField)((selectedField + 1) % (FIELD_TZ + 1));
+      if (selectedField == FIELD_NONE) selectedField = FIELD_YEAR;
+      drawButtonP(btnMode, S_SELECT, C565(255, 0, 0), 0xFFFF, true, true);
+      if (prev != FIELD_NONE && prev != selectedField) drawFieldPanel(prev, false);
+      lastBlinkTime = now;
+      blinkState = false;
+      redraw = true;
+
+    } else if (buttonStates[i].btn == &btnVal2Minus && selectedField != FIELD_NONE) {
+      drawButton(btnVal2Minus, "-", C565(30, 30, 30), 0xFFFF, true, true);
+      switch (selectedField) {
+        case FIELD_YEAR:
+          currentYear = max(2025, currentYear - 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_MONTH:
+          currentMonth = max(1, currentMonth - 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_DAY:
+          currentDay = max(1, currentDay - 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_HOUR:
+          currentHour = max(0, currentHour - 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_MINUTE:
+          currentMinute = max(0, currentMinute - 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_SECOND:
+          currentSecond = max(0, currentSecond - 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_TZ:
+          settings.tzOffsetHours = max(-12, (int)settings.tzOffsetHours - 1);
+          settingsDirty = true;
+          break;
+        default: break;
+      }
+      redraw = true;
+
+    } else if (buttonStates[i].btn == &btnVal2Plus && selectedField != FIELD_NONE) {
+      drawButton(btnVal2Plus, "+", C565(30, 30, 30), 0xFFFF, true, true);
+      switch (selectedField) {
+        case FIELD_YEAR:
+          currentYear = min(2099, currentYear + 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_MONTH:
+          currentMonth = min(12, currentMonth + 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_DAY:
+          currentDay = min(31, currentDay + 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_HOUR:
+          currentHour = min(23, currentHour + 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_MINUTE:
+          currentMinute = min(59, currentMinute + 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_SECOND:
+          currentSecond = min(59, currentSecond + 1);
+          timeFieldsDirty = true;
+          break;
+        case FIELD_TZ:
+          settings.tzOffsetHours = min(14, (int)settings.tzOffsetHours + 1);
+          settingsDirty = true;
+          break;
+        default: break;
+      }
+      redraw = true;
+
+    } else if (buttonStates[i].btn == &btnBack) {
+      drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+      delay(SCREEN_DELAY_MS);
+
+      // Новое: либо записываем явно выбранные поля локального времени,
+      // либо, если поля не редактировались, но TZ изменился — смещаем текущее RTC-время на дельту TZ.
+      int8_t deltaTz = (int8_t)(settings.tzOffsetHours - tzOnEntry);
+      if (timeFieldsDirty) {
+        rtc.adjust(DateTime(currentYear, currentMonth, currentDay, currentHour, currentMinute, currentSecond));
+      } else if (deltaTz != 0 && rtcOk) {
+        uint32_t u = rtc.now().unixtime();
+        rtc.adjust(DateTime(u + (long)deltaTz * 3600L));
+      }
+      rtcOk = true;
+      rtcBatteryFault = false;
+
+      if (settingsDirty) saveSettings();  // сохранить TZ и прочее
+      selectedField = FIELD_NONE;
+      currentScreen = SCREEN_SYSTEM;
+      forceRedraw = true;
+      drawSystemScreen(true);
+      return;
+    }
+    break;
+  }
+
+  if (redraw) {
+    if (selectedField != FIELD_NONE) drawFieldPanel(selectedField, false);
+    drawClockFace(false);
+    uiNeedsUpdate = true;
+  }
+
+  static unsigned long lastButtonUpdate = 0;
+  if (SAFE_MILLIS_DIFF(lastButtonUpdate, now) > PRESS_VISUAL_MS) {
+    updateButtonVisuals();
+    lastButtonUpdate = now;
+  }
+}
+
+
+// ======================================================================
+//                      SETTINGS HUB / RECIPES
+// ======================================================================
+
+void drawSettingsHubScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+    tft.fillScreen(C565(70, 82, 95));
+    drawBackground();
+    DateTime now_dt = rtcOk ? rtc.now() : DateTime(0UL);
+    drawStatusBar(true, now_dt);
+
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_SETTINGS_FULL);
+    int text_width = tft.textWidth(g_char_buffer);
+    int text_x = (tft.width() - text_width) / 2;
+    tft.drawString(g_char_buffer, text_x, SETTINGS_HEADER_Y);
+    tft.unloadFont();
+
+    // Три кнопки: РЕЦЕПТЫ, ТЕСТ АППАРАТУРЫ, СИСТЕМА
+    int btnWidth = 250, btnHeight = 50;
+    int btnX = (480 - btnWidth) / 2;
+    int y1 = HUB_BTN_START_Y;
+    int y2 = y1 + btnHeight + HUB_BTN_SPACING;
+    int y3 = y2 + btnHeight + HUB_BTN_SPACING;
+
+    btnHubRecipes = { btnX, y1, btnWidth, btnHeight };
+    btnHubHwTest = { btnX, y2, btnWidth, btnHeight };
+    btnHubSystem = { btnX, y3, btnWidth, btnHeight };
+
+    // РЕЦЕПТЫ
+    uint16_t yellowColor = C565(160, 120, 0);
+    uint16_t yellowTop = lighten565(yellowColor, 0.1f);
+    uint16_t yellowBottom = darken565(yellowColor, 0.2f);
+    drawVerticalGradientRounded(btnHubRecipes.x, btnHubRecipes.y, btnHubRecipes.w, btnHubRecipes.h, 8, yellowTop, yellowBottom, 3, true, TCache.shadowColor, 0xFFFF, false);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_RECIPES);
+    tft.drawString(g_char_buffer, btnHubRecipes.x + (btnHubRecipes.w - tft.textWidth(g_char_buffer)) / 2,
+                   btnHubRecipes.y + (btnHubRecipes.h - tft.fontHeight()) / 2);
+    tft.unloadFont();
+
+    // ТЕСТ АППАРАТУРЫ
+    uint16_t maroonColor = C565(120, 0, 0);
+    uint16_t maroonTop = lighten565(maroonColor, 0.1f);
+    uint16_t maroonBottom = darken565(maroonColor, 0.2f);
+    // Исправлено: 0.0FFFF -> 0xFFFF
+    drawVerticalGradientRounded(btnHubHwTest.x, btnHubHwTest.y, btnHubHwTest.w, btnHubHwTest.h, 8,
+                                maroonTop, maroonBottom, 3, true, TCache.shadowColor, 0xFFFF, false);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_HW_TEST);
+    tft.drawString(g_char_buffer, btnHubHwTest.x + (btnHubHwTest.w - tft.textWidth(g_char_buffer)) / 2,
+                   btnHubHwTest.y + (btnHubHwTest.h - tft.fontHeight()) / 2);
+    tft.unloadFont();
+
+    // СИСТЕМА
+    uint16_t grayColor = C565(100, 100, 100);
+    uint16_t grayTop = lighten565(grayColor, 0.1f);
+    uint16_t grayBottom = darken565(grayColor, 0.2f);
+    drawVerticalGradientRounded(btnHubSystem.x, btnHubSystem.y, btnHubSystem.w, btnHubSystem.h, 8, grayTop, grayBottom, 3, true, TCache.shadowColor, 0xFFFF, false);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_SYSTEM);
+    tft.drawString(g_char_buffer, btnHubSystem.x + (btnHubSystem.w - tft.textWidth(g_char_buffer)) / 2,
+                   btnHubSystem.y + (btnHubSystem.h - tft.fontHeight()) / 2);
+    tft.unloadFont();
+
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+    delay(SCREEN_DELAY_MS);
+    ;
+  }
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+void handleSettingsHubTouch(int x, int y) {
+  if (currentScreen != SCREEN_SETTINGS_HUB) return;
+  lastTouchTime = millis();
+
+  // Антидребезг
+  static unsigned long lastActionTime = 0;
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  auto pressDelay = []() {
+    delay(SCREEN_DELAY_MS);
+  };
+
+  // Цвета кнопок хаба (должны соответствовать drawSettingsHubScreen)
+  uint16_t yellowColor = C565(160, 120, 0);
+  uint16_t yellowTop = lighten565(yellowColor, 0.1f);
+  uint16_t yellowBot = darken565(yellowColor, 0.2f);
+
+  uint16_t maroonColor = C565(120, 0, 0);
+  uint16_t maroonTop = lighten565(maroonColor, 0.1f);
+  uint16_t maroonBot = darken565(maroonColor, 0.2f);
+
+  uint16_t grayColor = C565(100, 100, 100);
+  uint16_t grayTop = lighten565(grayColor, 0.1f);
+  uint16_t grayBot = darken565(grayColor, 0.2f);
+
+  // РЕЦЕПТЫ — pressed-визуал, затем переход
+  if (inBtn(btnHubRecipes, x, y)) {
+    beepClick();
+    uint16_t pTop = darken565(yellowTop, 0.5f), pBot = darken565(yellowBot, 0.5f);
+    uint16_t pMid = lerp565(pTop, pBot, 0.5f);
+    drawVerticalGradientRounded(btnHubRecipes.x, btnHubRecipes.y,
+                                btnHubRecipes.w, btnHubRecipes.h,
+                                8, pTop, pBot, 1, true, TCache.shadowColor, 0xFFFF, true);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, pMid);
+    tft.setTextDatum(MC_DATUM);
+    strcpy_P(g_char_buffer, S_RECIPES);
+    tft.drawString(g_char_buffer,
+                   btnHubRecipes.x + btnHubRecipes.w / 2,
+                   btnHubRecipes.y + btnHubRecipes.h / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+    tft.unloadFont();
+
+    pressDelay();
+    currentScreen = SCREEN_RECIPES;
+    drawRecipeScreen(true);
+    return;
+  }
+
+  // ТЕСТ АППАРАТУРЫ — pressed-визуал, затем переход
+  if (inBtn(btnHubHwTest, x, y)) {
+    beepClick();
+    uint16_t pTop = darken565(maroonTop, 0.5f), pBot = darken565(maroonBot, 0.5f);
+    uint16_t pMid = lerp565(pTop, pBot, 0.5f);
+    drawVerticalGradientRounded(btnHubHwTest.x, btnHubHwTest.y,
+                                btnHubHwTest.w, btnHubHwTest.h,
+                                8, pTop, pBot, 1, true, TCache.shadowColor, 0xFFFF, true);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, pMid);
+    tft.setTextDatum(MC_DATUM);
+    strcpy_P(g_char_buffer, S_HW_TEST);
+    tft.drawString(g_char_buffer,
+                   btnHubHwTest.x + btnHubHwTest.w / 2,
+                   btnHubHwTest.y + btnHubHwTest.h / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+    tft.unloadFont();
+
+    pressDelay();
+    currentScreen = SCREEN_HW_TEST;
+    drawHwTestScreen(true);
+    return;
+  }
+
+  // СИСТЕМА — pressed-визуал, затем переход
+  if (inBtn(btnHubSystem, x, y)) {
+    beepClick();
+    uint16_t pTop = darken565(grayTop, 0.5f), pBot = darken565(grayBot, 0.5f);
+    uint16_t pMid = lerp565(pTop, pBot, 0.5f);
+    drawVerticalGradientRounded(btnHubSystem.x, btnHubSystem.y,
+                                btnHubSystem.w, btnHubSystem.h,
+                                8, pTop, pBot, 1, true, TCache.shadowColor, 0xFFFF, true);
+    tft.loadFont(RotondaBold20);
+    tft.setTextColor(TFT_WHITE, pMid);
+    tft.setTextDatum(MC_DATUM);
+    strcpy_P(g_char_buffer, S_SYSTEM);
+    tft.drawString(g_char_buffer,
+                   btnHubSystem.x + btnHubSystem.w / 2,
+                   btnHubSystem.y + btnHubSystem.h / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+    tft.unloadFont();
+
+    pressDelay();
+    currentScreen = SCREEN_SYSTEM;
+    drawSystemScreen(true);
+    return;
+  }
+
+  // НАЗАД — как и было
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    ;
+    currentScreen = SCREEN_MAIN;
+    drawStaticLayout();
+  }
+}
+
+
+
+void drawRecipeScreen(bool fullRedraw) {
+  if (!fullRedraw) {
+    updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+    return;
+  }
+
+  // Сброс визуального состояния кнопок
+  for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+    buttonStates[i].pressed = false;
+    buttonStates[i].pressTime = 0;
+  }
+
+  tft.fillScreen(C565(70, 82, 95));
+  drawSettingsHeader(S_RECIPES, false);
+
+  // Компактные размеры под список: на основе твоих SYSTEM_* + небольшой “минус”
+  const int btnW = SYSTEM_BTN_WIDTH - 10;  // уже не налезет на НАЗАД
+  const int btnH = SYSTEM_BTN_HEIGHT - 8;  // 42 при SYSTEM_BTN_HEIGHT=50
+  const int gap = SYSTEM_BTN_SPACING;      // 10
+  const int x = (tft.width() - btnW) / 2;
+  const int y0 = HUB_BTN_START_Y - 6;  // 70 (у тебя задано глобально)
+
+  // Геометрия 4 кнопок рецептов (КОППА, ХАМОН, САЛЬЧИЧОН, ФУЭТ)
+  btnHubRecipes = { x, y0 + (btnH + gap) * 0, btnW, btnH };  // КОППА
+  btnHubHwTest = { x, y0 + (btnH + gap) * 1, btnW, btnH };   // ХАМОН
+  btnHubSystem = { x, y0 + (btnH + gap) * 2, btnW, btnH };   // САЛЬЧИЧОН
+  btnRecipeFuet = { x, y0 + (btnH + gap) * 3, btnW, btnH };  // ФУЭТ
+
+  // Локальные подписи (PROGMEM), чтобы не плодить глобальные строки
+  static const char S_KOPPA_BTN[] PROGMEM = "КОППА";
+  static const char S_HAMON_BTN[] PROGMEM = "ХАМОН";
+  static const char S_SAL_BTN[] PROGMEM = "КОЛБАСА САЛЬЧИЧОН 55 мм";
+  static const char S_FUET_BTN[] PROGMEM = "КОЛБАСА ФУЭТ 28 мм";
+
+  // Рисуем кнопки списком — минималистично
+  drawButtonP(btnHubRecipes, S_KOPPA_BTN, C565(128, 0, 32), 0xFFFF, true, false);
+  drawButtonP(btnHubHwTest, S_HAMON_BTN, C565(139, 69, 19), 0xFFFF, true, false);
+  drawButtonP(btnHubSystem, S_SAL_BTN, C565(100, 100, 100), 0xFFFF, true, false);
+  drawButtonP(btnRecipeFuet, S_FUET_BTN, C565(0, 120, 140), 0xFFFF, true, false);
+
+  // Кнопка НАЗАД у тебя уже задана глобально (btnBack), её просто перерисуем
+  drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+
+  // Все четыре кнопки оканчиваются на y = 268 (при твоих константах),
+  // btnBack начинается с y = 270 — пересечений нет.
+
+  delay(SCREEN_DELAY_MS);
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+void handleRecipeTouch(int x, int y) {
+  if (currentScreen != SCREEN_RECIPES) return;
+  lastTouchTime = millis();
+
+  static unsigned long lastActionTime = 0;
+  const unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  // Нажатия по 4 рецептам
+  if (inBtn(btnHubRecipes, x, y)) {
+    beepClick();
+    currentScreen = SCREEN_KOPPA;
+    drawKoppaScreen(true);
+    return;
+  }
+  if (inBtn(btnHubHwTest, x, y)) {
+    beepClick();
+    currentScreen = SCREEN_HAMON;
+    drawHamonScreen(true);
+    return;
+  }
+  if (inBtn(btnHubSystem, x, y)) {
+    beepClick();
+    currentScreen = SCREEN_SALCHICHON;
+    drawSalchichonScreen(true);
+    return;
+  }
+  if (inBtn(btnRecipeFuet, x, y)) {
+    beepClick();
+    currentScreen = SCREEN_FUET;
+    drawFuetScreen(true);
+    return;
+  }
+
+  // НАЗАД
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_SETTINGS_HUB;
+    drawSettingsHubScreen(true);
+    return;
+  }
+}
+
+// --- ДОБАВИТЬ рядом с реализацией drawButton()/drawButtonP ---
+void drawModeButton(Mode3 mode, bool pressed) {
+  const char* m_P = S_ERROR;
+  uint16_t fill = C565(80, 80, 80);  // OFF (серый) по умолчанию
+  switch (mode) {
+    case MODE_ON:
+      m_P = S_MODE_ON;
+      fill = TCache.alertColor;  // ВКЛ — красный (унифицированный alertColor)
+      break;
+    case MODE_OFF:
+      m_P = S_MODE_OFF;
+      fill = C565(80, 80, 80);  // ВЫКЛ — серый
+      break;
+    case MODE_AUTO:
+      m_P = S_MODE_AUTO;
+      fill = darkGreenMode;  // АВТО — зелёный (унифицированный okColor)
+      break;
+    case MODE_TIMED:
+      m_P = S_MODE_TIMED;
+      fill = C565(80, 0, 30);  // ТАЙМЕР — тёмно-бордовый
+      break;
+    default:
+      m_P = S_ERROR;
+      fill = C565(80, 80, 80);
+      break;
+  }
+  drawButtonP(btnMode, m_P, fill, 0xFFFF, true, pressed);
+}
+
+
+
+
+// ======================================================================
+//                         CALIBRATION SCREEN
+// ======================================================================
+void drawCalibrationScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    drawSettingsHeader(S_CALIBRATION, false);
+  }
+  uint16_t pc = LIGHT_GREEN_PANEL;
+  drawValueDisplay(SETTINGS_PANEL_Y1, S_TEMP_OFFSET, S_UNIT_C, settings.tempBias, pc);
+  drawValueDisplay(SETTINGS_PANEL_Y2, S_HUM_OFFSET, S_UNIT_PCT, settings.humBias, pc);
+  drawButton(btnVal1Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+  drawButton(btnVal1Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+  drawButton(btnVal2Minus, "-", C565(80, 80, 80), 0xFFFF, true, false);
+  drawButton(btnVal2Plus, "+", C565(80, 80, 80), 0xFFFF, true, false);
+  drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+  delay(SCREEN_DELAY_MS);
+  ;
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+// ======================================================================
+//                          BACKUP SCREEN
+// ======================================================================
+
+// ======================================================================
+//                         HW TEST SCREEN
+// ======================================================================
+void drawHwTestScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    drawSettingsHeader(S_HW_TEST, false);
+    uint16_t darkGreen = C565(0, 40, 0);
+    uint16_t darkerGray = C565(45, 45, 45);
+
+    drawButton(btnTestHeater, "НАГРЕВАТЕЛЬ", heaterState ? darkGreen : darkerGray, 0xFFFF, true, false);
+    drawButton(btnTestCooler, "ОХЛАДИТЕЛЬ", coolerState ? darkGreen : darkerGray, 0xFFFF, true, false);
+    drawButton(btnTestHumidifier, "УВЛАЖНИТЕЛЬ", humidifierState ? darkGreen : darkerGray, 0xFFFF, true, false);
+    drawButton(btnTestFan, "ВЕНТИЛЯТОР", fanState ? darkGreen : darkerGray, 0xFFFF, true, false);
+    drawButtonP(btnBack, S_BACK, darkGreen, 0xFFFF, true, false);
+    delay(SCREEN_DELAY_MS);
+    ;
+    forceRedraw = false;
+  } else {
+    uint16_t darkGreen = C565(0, 40, 0);
+    uint16_t darkerGray = C565(45, 45, 45);
+    if (ui_prevHeater != heaterState) {
+      drawButton(btnTestHeater, "НАГРЕВАТЕЛЬ", heaterState ? darkGreen : darkerGray, 0xFFFF, true, false);
+      ui_prevHeater = heaterState;
+    }
+    if (ui_prevCooler != coolerState) {
+      drawButton(btnTestCooler, "ОХЛАДИТЕЛЬ", coolerState ? darkGreen : darkerGray, 0xFFFF, true, false);
+      ui_prevCooler = coolerState;
+    }
+    if (ui_prevHumid != humidifierState) {
+      drawButton(btnTestHumidifier, "УВЛАЖНИТЕЛЬ", humidifierState ? darkGreen : darkerGray, 0xFFFF, true, false);
+      ui_prevHumid = humidifierState;
+    }
+    if (ui_prevFan != fanState) {
+      drawButton(btnTestFan, "ВЕНТИЛЯТОР", fanState ? darkGreen : darkerGray, 0xFFFF, true, false);
+      ui_prevFan = fanState;
+    }
+  }
+  if (fullRedraw) {
+    updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+  }
+}
+
+void handleHwTestTouch(int x, int y) {
+  static unsigned long lastAction = 0;
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastAction, now) < TOUCH_DEBOUNCE_MS) return;
+  lastAction = now;
+
+  // Проверяем только кнопки этого экрана, не трогаем общие +/- и прочие buttonStates.
+  if (inBtn(btnTestHeater, x, y)) {
+    beepClick();
+    setHeater(!heaterState);
+    drawButton(btnTestHeater, "НАГРЕВАТЕЛЬ",
+               heaterState ? C565(0, 40, 0) : C565(45, 45, 45),
+               0xFFFF, true, false);
+    // НИЧЕГО не просим перерисовывать глобально: кнопка уже обновлена.
+    return;
+  }
+
+  if (inBtn(btnTestCooler, x, y)) {
+    beepClick();
+    setCooler(!coolerState);
+    drawButton(btnTestCooler, "ОХЛАДИТЕЛЬ",
+               coolerState ? C565(0, 40, 0) : C565(45, 45, 45),
+               0xFFFF, true, false);
+    return;
+  }
+
+  if (inBtn(btnTestHumidifier, x, y)) {
+    beepClick();
+    setHumidifier(!humidifierState);
+    drawButton(btnTestHumidifier, "УВЛАЖНИТЕЛЬ",
+               humidifierState ? C565(0, 40, 0) : C565(45, 45, 45),
+               0xFFFF, true, false);
+    return;
+  }
+
+  if (inBtn(btnTestFan, x, y)) {
+    beepClick();
+    setFan(!fanState);
+    drawButton(btnTestFan, "ВЕНТИЛЯТОР",
+               fanState ? C565(0, 40, 0) : C565(45, 45, 45),
+               0xFFFF, true, false);
+    return;
+  }
+
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_SETTINGS_HUB;
+    drawSettingsHubScreen(true);
+    return;
+  }
+}
+
+void drawKoppaScreen(bool fullRedraw) {
+  if (!fullRedraw) {
+    updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+    return;
+  }
+
+  // Заголовок в PROGMEM для drawSettingsHeader
+
+
+  tft.fillScreen(C565(70, 82, 95));
+  drawSettingsHeader(S_KOPPA_HEADER, false);
+
+  const bool activeMine = (program.active && strcmp(currentProgramName, "КОППА") == 0);
+
+  // Кнопки: режим и назад
+  drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+              activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+  drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+
+  // Временная программа КОППА для таблицы
+  CuringProgram tmp{};
+  buildKoppaProgram(tmp);
+
+  // Таблица агрегированных групп для КОППА
+  size_t groupCount = 4;
+  drawRecipeAggregatedTable(G_KOPPA_RAM, groupCount, tmp);
+
+  delay(SCREEN_DELAY_MS);
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+
+void drawHamonScreen(bool fullRedraw) {
+  if (!fullRedraw) {
+    updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+    return;
+  }
+
+
+  tft.fillScreen(C565(70, 82, 95));
+  drawSettingsHeader(S_HAMON_HEADER, false);
+
+  const bool activeMine = (program.active && strcmp(currentProgramName, "ХАМОН") == 0);
+
+  drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+              activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+  drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+
+  // Временная программа ХАМОН для таблицы
+  CuringProgram tmp{};
+  buildHamonProgram(tmp);
+
+  size_t groupCount = 4;
+  drawRecipeAggregatedTable(G_HAMON_RAM, groupCount, tmp);
+
+
+  delay(SCREEN_DELAY_MS);
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+void drawSalchichonScreen(bool fullRedraw) {
+  if (!fullRedraw) {
+    updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+    return;
+  }
+
+
+  tft.fillScreen(C565(70, 82, 95));
+  drawSettingsHeader(S_SALCHICHON_HEADER, false);
+
+  const bool activeMine = (program.active && strcmp(currentProgramName, "КОЛБАСА САЛЬЧИЧОН 55 ММ") == 0);
+
+  drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+              activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+  drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+
+  // Временная программа САЛЬЧИЧОН
+  CuringProgram tmp{};
+  buildSalchichonProgram(tmp);
+
+  size_t groupCount = 4;
+  drawRecipeAggregatedTable(G_SAL_RAM, groupCount, tmp);
+
+  delay(SCREEN_DELAY_MS);
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+void drawFuetScreen(bool fullRedraw) {
+  if (!fullRedraw) {
+    updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+    return;
+  }
+
+
+  tft.fillScreen(C565(70, 82, 95));
+  drawSettingsHeader(S_FUET_HEADER, false);
+
+  const bool activeMine = (program.active && strcmp(currentProgramName, "КОЛБАСА ФУЭТ 28 ММ") == 0);
+
+  drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+              activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+  drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+
+  // Временная программа ФУЭТ
+  CuringProgram tmp{};
+  buildFuetProgram(tmp);
+
+  size_t groupCount = 4;
+  drawRecipeAggregatedTable(G_FUET_RAM, groupCount, tmp);
+
+
+  delay(SCREEN_DELAY_MS);
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+
+// === REPLACE: КОППА — запуск/стоп только через startProgramByName()/stopProgramAndReset(), запрет при !rtcOk ===
+void handleKoppaTouch(int x, int y) {
+
+  if (currentScreen != SCREEN_KOPPA) return;
+  lastTouchTime = millis();
+  static unsigned long lastActionTime = 0;
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  if (inBtn(btnMode, x, y)) {
+    beepClick();
+    const bool willActivate = !(program.active && strcmp(currentProgramName, "КОППА") == 0);
+    if (willActivate) {
+      if (!rtcOk) {
+        logEvent(F("Program start denied (RTC invalid). Set time first."));
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, true);
+        delay(SCREEN_DELAY_MS);
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, false);
+        return;
+      }
+      startProgramByName("КОППА");
+    } else {
+      stopProgramAndReset();
+    }
+
+    const bool activeMine = (program.active && strcmp(currentProgramName, "КОППА") == 0);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+    return;
+  }
+
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_RECIPES;
+    drawRecipeScreen(true);
+    return;
+  }
+}
+
+// === REPLACE: ХАМОН — запуск/стоп только через startProgramByName()/stopProgramAndReset(), запрет при !rtcOk ===
+void handleHamonTouch(int x, int y) {
+
+  if (currentScreen != SCREEN_HAMON) return;
+  lastTouchTime = millis();
+  static unsigned long lastActionTime = 0;
+  const unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  if (inBtn(btnMode, x, y)) {
+    beepClick();
+    const bool willActivate = !(program.active && strcmp(currentProgramName, "ХАМОН") == 0);
+    if (willActivate) {
+      if (!rtcOk) {
+        logEvent(F("Program start denied (RTC invalid). Set time first."));
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, true);
+        delay(SCREEN_DELAY_MS);
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, false);
+        return;
+      }
+      startProgramByName("ХАМОН");
+    } else {
+      stopProgramAndReset();
+    }
+
+    const bool activeMine = (program.active && strcmp(currentProgramName, "ХАМОН") == 0);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+    return;
+  }
+
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_RECIPES;
+    drawRecipeScreen(true);
+    return;
+  }
+}
+
+// === REPLACE: САЛЬЧИЧОН — запуск/стоп только через startProgramByName()/stopProgramAndReset(), запрет при !rtcOk ===
+void handleSalchichonTouch(int x, int y) {
+
+  if (currentScreen != SCREEN_SALCHICHON) return;
+  lastTouchTime = millis();
+  static unsigned long lastActionTime = 0;
+  const unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  if (inBtn(btnMode, x, y)) {
+    beepClick();
+    const bool willActivate = !(program.active && strcmp(currentProgramName, "КОЛБАСА САЛЬЧИЧОН 55 ММ") == 0);
+    if (willActivate) {
+      if (!rtcOk) {
+        logEvent(F("Program start denied (RTC invalid). Set time first."));
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, true);
+        delay(SCREEN_DELAY_MS);
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, false);
+        return;
+      }
+      startProgramByName("САЛЬЧИЧОН");
+    } else {
+      stopProgramAndReset();
+    }
+
+    const bool activeMine = (program.active && strcmp(currentProgramName, "КОЛБАСА САЛЬЧИЧОН 55 ММ") == 0);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+    return;
+  }
+
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_RECIPES;
+    drawRecipeScreen(true);
+    return;
+  }
+}
+
+
+// === REPLACE: ФУЭТ — запуск/стоп только через startProgramByName()/stopProgramAndReset(), запрет при !rtcOk ===
+void handleFuetTouch(int x, int y) {
+
+  if (currentScreen != SCREEN_FUET) return;
+  lastTouchTime = millis();
+  static unsigned long lastActionTime = 0;
+  const unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  if (inBtn(btnMode, x, y)) {
+    beepClick();
+    const bool willActivate = !(program.active && strcmp(currentProgramName, "КОЛБАСА ФУЭТ 28 ММ") == 0);
+    if (willActivate) {
+      if (!rtcOk) {
+        logEvent(F("Program start denied (RTC invalid). Set time first."));
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, true);
+        delay(SCREEN_DELAY_MS);
+        drawButtonP(btnMode, S_STOPPED, C565(45, 45, 45), 0xFFFF, true, false);
+        return;
+      }
+      startProgramByName("ФУЭТ");
+    } else {
+      stopProgramAndReset();
+    }
+
+    const bool activeMine = (program.active && strcmp(currentProgramName, "КОЛБАСА ФУЭТ 28 ММ") == 0);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    drawButtonP(btnMode, activeMine ? S_ACTIVE : S_STOPPED,
+                activeMine ? C565(255, 0, 0) : C565(45, 45, 45), 0xFFFF, true, false);
+    return;
+  }
+
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_RECIPES;
+    drawRecipeScreen(true);
+    return;
+  }
+}
+
+
+int8_t lastDrawnGroup = -1;
+float lastDrawnProgress = -1.0f;
+int lastFillW = -1;
+int percentZoneW = -1;
+
+float lastTotalProgress = -1.0f;
+int lastTotalFillW = -1;
+int pctZoneW = -1, pctZoneH = -1, pctLeft = -1, pctTop = -1;
+
+void resetProgressBarCaches() {
+  lastDrawnGroup = -1;
+  lastDrawnProgress = -1.0f;
+  lastFillW = -1;
+  percentZoneW = -1;
+
+  lastTotalProgress = -1.0f;
+  lastTotalFillW = -1;
+  pctZoneW = pctZoneH = pctLeft = pctTop = -1;
+}
+
+// ======================================================================
+//                      ПРОГРЕСС-БАРЫ ПРОГРАММЫ
+// ======================================================================
+
+void drawTotalProgressBar(bool fullRedraw) {
+  if (!program.active) return;
+
+
+
+  // Внешняя рамка/фон прогресс-бара
+  if (fullRedraw) {
+    uint16_t grayTop = C565(120, 120, 120);
+    uint16_t grayBottom = C565(80, 80, 80);
+    uint16_t borderGray = C565(128, 128, 128);
+
+    drawVerticalGradientRounded(
+      totalProgressCard.x, totalProgressCard.y, totalProgressCard.w - 20, totalProgressCard.h,
+      0, grayTop, grayBottom, 3, true, TCache.shadowColor, borderGray, false);
+
+    lastTotalProgress = -1.0f;
+    lastTotalFillW = -1;
+
+    // Рассчитываем фиксированную площадку под проценты (TL_DATUM)
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextDatum(TL_DATUM);
+    int fh = tft.fontHeight();
+    int wMax = tft.textWidth("100%");  // самый длинный вариант
+    pctZoneW = wMax + 10;              // небольшой запас по ширине
+    pctZoneH = fh + 8;                 // небольшой запас по высоте
+
+    // Выравниваем по центру по высоте карточки
+    pctLeft = totalProgressCard.x + totalProgressCard.w - 15 - 2;  // чутка левее края
+    pctTop = totalProgressCard.y + (totalProgressCard.h - pctZoneH) / 2;
+    tft.setFreeFont(NULL);
+  }
+
+  // Вычисление процента
+  uint64_t totalElapsed = programElapsedMsUnixOnly();
+  uint64_t totalDurationMillis = 0;
+  for (uint8_t s = 0; s < program.stageCount; s++) {
+    totalDurationMillis += (uint64_t)program.stages[s].durationHours * MILLIS_PER_HOUR;
+  }
+  float totalProgress = 0.0f;
+  if (totalDurationMillis > 0) {
+    totalProgress = (float)totalElapsed / (float)totalDurationMillis * 100.0f;
+    if (totalProgress > 100.0f) totalProgress = 100.0f;
+  }
+
+  // Внутренняя «полка» (фон полосы)
+  int innerX = totalProgressCard.x + PROGRESS_BAR_PADDING;
+  int innerY = totalProgressCard.y + PROGRESS_BAR_PADDING;
+  int innerW = (totalProgressCard.w - 20) - PROGRESS_BAR_PADDING * 2;
+  int innerH = totalProgressCard.h - PROGRESS_BAR_PADDING * 2;
+
+  uint16_t lighterGray = C565(130, 130, 130);
+  if (fullRedraw) {
+    tft.fillRect(innerX, innerY, innerW, innerH, lighterGray);
+    lastTotalFillW = -1;
+  }
+
+  // Заголовок "ОБЩИЙ ПРОГРЕСС:"
+  if (fullRedraw) {
+    tft.loadFont(RotondaBold20);
+    int fh = tft.fontHeight();
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    strcpy_P(g_char_buffer, S_TOTAL_PROGRESS);  // используем существующий макрос
+    int textY = totalProgressCard.y - (fh + 8);
+    tft.drawString(g_char_buffer, totalProgressCard.x + 15, textY);
+    tft.unloadFont();
+  }
+
+  // Заполнение полосы
+  int fillW = (int)(innerW * totalProgress / 100.0f);
+  if (fillW != lastTotalFillW || fullRedraw) {
+    if (fillW < lastTotalFillW || fullRedraw) {
+      tft.fillRect(innerX, innerY, innerW, innerH, lighterGray);
+    }
+    if (fillW > 0) {
+      uint16_t green = C565(0, 200, 0);
+      tft.fillRect(innerX, innerY, fillW, innerH, green);
+    }
+    lastTotalFillW = fillW;
+  }
+
+  // Проценты справа — всегда полная очистка фиксированной площадки, затем печать
+  if (fullRedraw || fabs(totalProgress - lastTotalProgress) >= 0.1f) {
+    char percentBuf[8];
+    snprintf(percentBuf, sizeof(percentBuf), "%d%%", (int)totalProgress);
+
+    uint16_t bg = C565(70, 82, 95);  // цвет фона экрана/области
+    // Полная зачистка площадки — исключает «хвосты» при 100% -> 0% и т.п.
+    tft.fillRect(pctLeft, pctTop, pctZoneW, pctZoneH, bg);
+
+    // Печать в TL_DATUM с небольшим внутренним отступом
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextDatum(TL_DATUM);
+    int textX = pctLeft + 3;
+    int textY = pctTop + (pctZoneH - tft.fontHeight()) / 2;
+
+    // Лёгкая «тень»
+    tft.setTextColor(TFT_BLACK, bg);
+    tft.drawString(percentBuf, textX + 1, textY + 1);
+
+    // Основной текст
+    tft.setTextColor(C565(0, 255, 0), bg);
+    tft.drawString(percentBuf, textX, textY);
+
+    tft.setFreeFont(NULL);
+    lastTotalProgress = totalProgress;
+  }
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(0);
+}
+
+
+
+// === Полная версия: прогресс‑бар текущей группы с единым выбором групп ===
+
+void drawMainProgressBar(bool fullRedraw) {
+  if (!program.active) return;
+
+
+
+  if (fullRedraw) {
+    uint16_t grayTop = C565(120, 120, 120), grayBottom = C565(80, 80, 80), borderGray = C565(128, 128, 128);
+    // Внешняя рамка/фон бара
+    drawVerticalGradientRounded(progressCard.x, progressCard.y, progressCard.w - 20, progressCard.h,
+                                0, grayTop, grayBottom, 3, true, TCache.shadowColor, borderGray, false);
+    lastDrawnGroup = -1;
+    lastDrawnProgress = -1.0f;
+    lastFillW = -1;
+    percentZoneW = -1;
+  }
+
+  const GroupDefPGM* groups = getGroupsPGM();
+  uint64_t totalElapsed = programElapsedMsUnixOnly();
+
+  int currentGroup = -1;
+  for (int g = 0; g < 4; g++) {
+    if (program.currentStage >= groups[g].start && program.currentStage <= groups[g].end) {
+      currentGroup = g;
+      break;
+    }
+  }
+  if (currentGroup == -1) return;
+
+  uint64_t groupTotal = 0, groupStart = 0;
+  for (uint8_t s = 0; s < program.stageCount; s++) {
+    uint64_t dur = (uint64_t)program.stages[s].durationHours * MILLIS_PER_HOUR;
+    if (s < groups[currentGroup].start) groupStart += dur;
+    if (s >= groups[currentGroup].start && s <= groups[currentGroup].end) groupTotal += dur;
+  }
+  uint64_t groupElapsed = totalElapsed > groupStart ? totalElapsed - groupStart : 0;
+
+  float groupProgress = 0.0f;
+  if (groupTotal > 0) {
+    groupProgress = (float)groupElapsed / (float)groupTotal * 100.0f;
+    if (groupProgress > 100.0f) groupProgress = 100.0f;
+  }
+
+  bool groupChanged = (currentGroup != lastDrawnGroup);
+
+  int innerX = progressCard.x + PROGRESS_BAR_PADDING;
+  int innerY = progressCard.y + PROGRESS_BAR_PADDING;
+  int innerW = (progressCard.w - 20) - PROGRESS_BAR_PADDING * 2;
+  int innerH = progressCard.h - PROGRESS_BAR_PADDING * 2;
+
+  uint16_t lighterGray = C565(130, 130, 130);
+  if (fullRedraw || groupChanged) {
+    // Полка под заливку прогресса
+    tft.fillRect(innerX, innerY, innerW, innerH, lighterGray);
+    lastFillW = -1;
+  }
+
+  // Подпись "ЭТАП: <ГРУППА>:"
+  if (fullRedraw || groupChanged) {
+    tft.loadFont(RotondaBold20);
+    int fh = tft.fontHeight();
+
+    char stageText[64];
+    strcpy_P(stageText, S_STAGE_LABEL);  // используем существующий макрос
+    strcat(stageText, " ");
+    strcat_P(stageText, groups[currentGroup].name_P);
+    strcat(stageText, ":");
+
+    int labelX = progressCard.x - 6 + 8;
+    int labelY = progressCard.y - (fh + 10);
+    int labelW = progressCard.w + 30;
+    uint16_t mainBg = C565(70, 82, 95);
+
+    tft.fillRect(labelX, labelY, labelW, fh + 12, mainBg);
+    tft.setTextColor(TFT_WHITE, mainBg);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(stageText, labelX, labelY);
+
+    tft.unloadFont();
+  }
+
+  // Заливка прогресса
+  int fillW = (int)(innerW * groupProgress / 100.0f);
+  if (fillW != lastFillW || fullRedraw || groupChanged) {
+    if (fillW < lastFillW || fullRedraw || groupChanged) {
+      tft.fillRect(innerX, innerY, innerW, innerH, lighterGray);
+    }
+    if (fillW > 0) {
+      uint16_t green = C565(0, 200, 0);
+      tft.fillRect(innerX, innerY, fillW, innerH, green);
+    }
+    lastFillW = fillW;
+  }
+
+  // Проценты справа — с корректной зачисткой
+  if (fullRedraw || groupChanged || fabs(groupProgress - lastDrawnProgress) >= 1.0f) {
+    char percentBuf[8];
+    snprintf(percentBuf, sizeof(percentBuf), "%d%%", (int)groupProgress);
+
+    int percentX = progressCard.x + progressCard.w - 15;
+    int percentY = progressCard.y + progressCard.h / 2 - 2;
+    uint16_t bg = C565(70, 82, 95);
+
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    int currentW = tft.textWidth(percentBuf);
+    if (percentZoneW < 0) {
+      percentZoneW = tft.textWidth("100%");
+      if (percentZoneW < currentW) percentZoneW = currentW;
+      percentZoneW += 8;  // небольшой запас
+    }
+
+    // Очистка под надпись процента
+    tft.fillRect(percentX - 4, percentY - 12, percentZoneW, 24, bg);
+
+    // Рисуем процент (легкая «тень»)
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString(percentBuf, percentX + 1, percentY + 1);
+    tft.setTextColor(C565(0, 255, 0));
+    tft.drawString(percentBuf, percentX, percentY);
+    tft.setFreeFont(NULL);
+
+    lastDrawnProgress = groupProgress;
+  }
+
+  lastDrawnGroup = currentGroup;
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(0);
+}
+
+// ======================================================================
+//                 ДОП. ИКОНКИ, ЧАСЫ: МЕТКИ, ОБЩИЕ ЗАГЛУШКИ
+// ======================================================================
+
+// Капля воды (иконка влажности)
+void iconDrop(int cx, int cy, bool active, uint16_t base) {
+  int x = cx - 17;                    // Увеличено с 14 до 17 (ширина с 28 до 34)
+  int y = cy - 22;                    // Увеличено с 18 до 22 (высота с 36 до 43)
+  int w = 34;                         // Новая ширина
+  int h = 43;                         // Новая высота
+  uint16_t outlineColor = TFT_BLACK;  // Тонкая чёрная обводка (внутренняя)
+
+  // Тело капли: круг + треугольник
+  tft.fillCircle(x + w / 2, y + h - (w / 2), w / 2, base);
+  tft.fillTriangle(x, y + h - (w / 2), x + w, y + h - (w / 2), x + w / 2, y, base);
+
+  // Чёрная внутренняя обводка (как в старой версии)
+  tft.drawCircle(x + w / 2, y + h - (w / 2), w / 2, outlineColor);
+  tft.drawLine(x, y + h - (w / 2), x + w / 2, y, outlineColor);
+  tft.drawLine(x + w, y + h - (w / 2), x + w / 2, y, outlineColor);
+
+  // Белый рефлекс (градиентный блик) в верхней части
+  uint16_t reflexTop = TFT_WHITE;                  // Яркий белый сверху
+  uint16_t reflexBottom = lighten565(base, 0.7f);  // Полупрозрачный к цвету капли
+  int reflexX = x + w / 2 - 11;                    // Сдвиг левее
+  int reflexY = y + h - 26;                        // Сдвиг выше
+  for (int i = 0; i < 8; i++) {                    // Вертикальный градиент блика (высота 8px)
+    float k = (float)i / 7.0f;
+    uint16_t reflexColor = lerp565(reflexTop, reflexBottom, k);
+    tft.drawFastHLine(reflexX, reflexY + i, 8, reflexColor);
+  }
+
+  // Акцент (голубой круг) — сдвинут под рефлекс
+  tft.fillCircle(cx - 4, cy - 4, 5, C565(0, 153, 255));
+
+  // Доп. обводка белым по контуру — только если неактивно
+  if (!active) {
+    uint16_t white = 0xFFFF;  // Чистый белый
+    int centerX = x + w / 2;
+    int centerY = y + h - (w / 2);
+    int topY = y + h - (w / 2);  // База треугольника
+
+    // Обводка круга (по краю)
+    tft.drawCircle(centerX, centerY, w / 2, white);
+
+    // Обводка треугольника (левая, правая, база)
+    tft.drawLine(x, topY, centerX, y, white);      // Левая сторона
+    tft.drawLine(x + w, topY, centerX, y, white);  // Правая сторона
+    tft.drawLine(x, topY, x + w, topY, white);     // База (соединение с кругом)
+  }
+}
+
+void drawClockLabels() {
+  int leftX = 35, rightX = 365, yStart = 65, spacing = 50;
+  uint16_t bgColor = C565(70, 82, 95);
+
+  tft.loadFont(RotondaBold20);
+  tft.setTextColor(TFT_WHITE, bgColor);
+
+  strcpy_P(g_char_buffer, S_YEAR);
+  tft.drawString(g_char_buffer, leftX - tft.textWidth(g_char_buffer) - 10, yStart + (30 - tft.fontHeight()) / 2);
+
+  strcpy_P(g_char_buffer, S_MONTH);
+  tft.drawString(g_char_buffer, leftX - tft.textWidth(g_char_buffer) - 10, yStart + spacing + (30 - tft.fontHeight()) / 2);
+
+  strcpy_P(g_char_buffer, S_DAY);
+  tft.drawString(g_char_buffer, leftX - tft.textWidth(g_char_buffer) - 10, yStart + spacing * 2 + (30 - tft.fontHeight()) / 2);
+
+  strcpy_P(g_char_buffer, S_HOUR);
+  tft.drawString(g_char_buffer, rightX + 80 + 10, yStart + (30 - tft.fontHeight()) / 2);
+
+  strcpy_P(g_char_buffer, S_MINUTE);
+  tft.drawString(g_char_buffer, rightX + 80 + 10, yStart + spacing + (30 - tft.fontHeight()) / 2);
+
+  // Обозначение секунд
+  strcpy_P(g_char_buffer, PSTR("С:"));
+  tft.drawString(g_char_buffer, rightX + 80 + 10, yStart + spacing * 2 + (30 - tft.fontHeight()) / 2);
+
+  tft.unloadFont();
+}
+
+unsigned long autoRepeatIntervalMs(unsigned long heldMs) {
+  // Профиль ускорения: чем дольше держим, тем чаще шаги
+  if (heldMs < 250) return 250;  // небольшая пауза после первого тапа
+  if (heldMs < 1000) return 80;
+  if (heldMs < 2000) return 40;
+  if (heldMs < 4000) return 20;
+  return 10;  // быстрое “кручение””
+}
+
+bool autoRepeatStep(Button* B) {
+  if (!B) return false;
+
+  const unsigned long now = millis();
+  const unsigned long heldMs = SAFE_MILLIS_DIFF(gHoldStartMs, now);
+  float f = 1.0f;
+  if (heldMs >= 6000) f = 10.0f;
+  else if (heldMs >= 3000) f = 5.0f;
+  else if (heldMs >= 1500) f = 2.0f;
+
+  const int dir = (B == &btnVal1Plus || B == &btnVal2Plus) ? +1 : -1;
+
+  switch (currentScreen) {
+
+    case SCREEN_HEATER:
+      {
+        if (B == &btnVal1Minus || B == &btnVal1Plus) {
+          float step = STEP_TEMP * f;  // 0.1 → 0.2 → 0.5 → 1.0 ...
+          settings.targetTemp = constrain(settings.targetTemp + dir * step, MIN_TEMP, MAX_TEMP);
+          drawValueDisplay(SETTINGS_PANEL_Y1, S_TARGET, S_UNIT_C, settings.targetTemp, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        } else if (B == &btnVal2Minus || B == &btnVal2Plus) {
+          float step = STEP_HYST * f;
+          settings.tempHeatHysteresis = constrain(settings.tempHeatHysteresis + dir * step, MIN_HYST, MAX_HYST_TEMP);
+          drawValueDisplay(SETTINGS_PANEL_Y2, S_HYST, S_UNIT_C, settings.tempHeatHysteresis, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        }
+        break;
+      }
+    case SCREEN_COOLER:
+      {
+        if (B == &btnVal1Minus || B == &btnVal1Plus) {
+          float step = STEP_TEMP * f;
+          settings.targetTemp = constrain(settings.targetTemp + dir * step, MIN_TEMP, MAX_TEMP);
+          drawValueDisplay(SETTINGS_PANEL_Y1, S_TARGET, S_UNIT_C, settings.targetTemp, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        } else if (B == &btnVal2Minus || B == &btnVal2Plus) {
+          float step = STEP_HYST * f;
+          settings.tempCoolHysteresis = constrain(settings.tempCoolHysteresis + dir * step, MIN_HYST, MAX_HYST_TEMP);
+          drawValueDisplay(SETTINGS_PANEL_Y2, S_HYST, S_UNIT_C, settings.tempCoolHysteresis, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        }
+        break;
+      }
+    case SCREEN_HUMID:
+      {
+        if (B == &btnVal1Minus || B == &btnVal1Plus) {
+          int stepI = (int)(f + 0.5f);
+          stepI = stepI < 1 ? 1 : stepI;  // 1,2,5,10
+          float step = STEP_HUM * stepI;  // STEP_HUM=1.0 → 1/2/5/10 %
+          settings.targetHum = constrain(settings.targetHum + dir * step, MIN_HUM, MAX_HUM);
+          drawValueDisplay(SETTINGS_PANEL_Y1, S_TARGET, S_UNIT_PCT, settings.targetHum, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        } else if (B == &btnVal2Minus || B == &btnVal2Plus) {
+          float step = STEP_HYST * f;
+          settings.humHysteresis = constrain(settings.humHysteresis + dir * step, MIN_HYST, MAX_HYST_HUM);
+          drawValueDisplay(SETTINGS_PANEL_Y2, S_HYST, S_UNIT_PCT, settings.humHysteresis, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        }
+        break;
+      }
+    case SCREEN_CALIBRATION:
+      {
+        if (B == &btnVal1Minus || B == &btnVal1Plus) {
+          float step = STEP_TEMP_BIAS * f;
+          settings.tempBias = constrain(settings.tempBias + dir * step, MIN_TEMP_BIAS, MAX_TEMP_BIAS);
+          drawValueDisplay(SETTINGS_PANEL_Y1, S_TEMP_OFFSET, S_UNIT_C, settings.tempBias, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        } else if (B == &btnVal2Minus || B == &btnVal2Plus) {
+          float step = STEP_HUM_BIAS * f;
+          settings.humBias = constrain(settings.humBias + dir * step, MIN_HUM_BIAS, MAX_HUM_BIAS);
+          drawValueDisplay(SETTINGS_PANEL_Y2, S_HUM_OFFSET, S_UNIT_PCT, settings.humBias, LIGHT_GREEN_PANEL);
+          settingsDirty = true;
+          return true;
+        }
+        break;
+      }
+
+    case SCREEN_FAN:
+      {
+        if (settings.fanMode != MODE_TIMED) return false;
+        int stepI = (int)(f + 0.5f);
+        stepI = stepI < 1 ? 1 : stepI;
+        if (B == &btnVal1Minus || B == &btnVal1Plus) {
+          int v = (int)settings.manualFanIntervalHours + dir * stepI;
+          v = max((int)MIN_FAN, min((int)MAX_FAN_INTERVAL, v));
+          settings.manualFanIntervalHours = (uint16_t)v;
+          drawValueDisplay(SETTINGS_PANEL_Y1, S_INTERVAL, S_UNIT_H, (float)settings.manualFanIntervalHours, LIGHT_GREEN_PANEL);
+
+          settingsDirty = true;
+          return true;
+        } else if (B == &btnVal2Minus || B == &btnVal2Plus) {
+          int v = (int)settings.manualFanDurationMinutes + dir * stepI;
+          v = max((int)MIN_FAN, min((int)MAX_FAN_DURATION, v));
+          settings.manualFanDurationMinutes = (uint16_t)v;
+          drawValueDisplay(SETTINGS_PANEL_Y2, S_DURATION, S_UNIT_MIN, (float)settings.manualFanDurationMinutes, LIGHT_GREEN_PANEL);
+
+          settingsDirty = true;
+          return true;
+        }
+        break;
+      }
+
+    case SCREEN_SET_CLOCK:
+      {
+        if (!(B == &btnVal2Minus || B == &btnVal2Plus)) return false;
+        if (selectedField == FIELD_NONE) return false;
+        int stepI = (int)(f + 0.5f);
+        stepI = stepI < 1 ? 1 : stepI;  // ускоряем перебор
+
+        switch (selectedField) {
+          case FIELD_YEAR:
+            currentYear = constrain(currentYear + dir * stepI, 2025, 2099);
+            timeFieldsDirty = true;
+            break;
+          case FIELD_MONTH:
+            currentMonth = constrain(currentMonth + dir * min(stepI, 3), 1, 12);
+            timeFieldsDirty = true;
+            break;
+          case FIELD_DAY:
+            currentDay = constrain(currentDay + dir * min(stepI, 7), 1, 31);
+            timeFieldsDirty = true;
+            break;
+          case FIELD_HOUR:
+            currentHour = constrain(currentHour + dir * min(stepI, 6), 0, 23);
+            timeFieldsDirty = true;
+            break;
+          case FIELD_MINUTE:
+            currentMinute = constrain(currentMinute + dir * min(stepI, 15), 0, 59);
+            timeFieldsDirty = true;
+            break;
+          case FIELD_SECOND:
+            currentSecond = constrain(currentSecond + dir * min(stepI, 15), 0, 59);
+            timeFieldsDirty = true;
+            break;
+          case FIELD_TZ:
+            settings.tzOffsetHours = (int8_t)constrain((int)settings.tzOffsetHours + dir * 1, -12, 14);
+            drawFieldPanel(FIELD_TZ, false);
+            settingsDirty = true;
+            return true;
+          default: break;
+        }
+        drawFieldPanel(selectedField, false);
+        return true;
+      }
+
+    default: break;
+  }
+  return false;
+}
+
+void processAutoRepeat() {
+  // ВАЖНО: здесь НЕ вызываем getTouchPoint(), иначе второй вызов в одном loop "съедает" тап.
+  FT6336U_TouchPointType tp = ctp.scan();
+
+  // Палец отпущен — сбросить состояние удержания
+  if (tp.touch_count == 0) {
+    gHeldPlusMinus = nullptr;
+    return;
+  }
+
+  // Координаты из raw touch -> координаты экрана (как в getTouchPoint)
+  int rawX = tp.tp[0].x;
+  int rawY = tp.tp[0].y;
+
+  int x = 479 - rawY;
+  int y = rawX;
+  x = constrain(x, 0, tft.width() - 1);
+  y = constrain(y, 0, tft.height() - 1);
+  // На каких экранах автоповтор +/- вообще актуален
+  bool screenHasPlusMinus = false;
+  switch (currentScreen) {
+    case SCREEN_HEATER:
+    case SCREEN_COOLER:
+    case SCREEN_HUMID:
+    case SCREEN_CALIBRATION:
+      screenHasPlusMinus = true;
+      break;
+
+    case SCREEN_FAN:
+      screenHasPlusMinus = (settings.fanMode == MODE_TIMED);
+      break;
+
+    case SCREEN_SET_CLOCK:
+      screenHasPlusMinus = (selectedField != FIELD_NONE);
+      break;
+
+    default:
+      screenHasPlusMinus = false;
+      break;
+  }
+
+  if (!screenHasPlusMinus) {
+    gHeldPlusMinus = nullptr;
+    return;
+  }
+
+  // Определяем, над какой кнопкой +/- сейчас держим палец
+  Button* candidate = nullptr;
+
+  if (currentScreen != SCREEN_SET_CLOCK) {
+    if (inBtn(btnVal1Minus, x, y)) candidate = &btnVal1Minus;
+    else if (inBtn(btnVal1Plus, x, y)) candidate = &btnVal1Plus;
+    else if (inBtn(btnVal2Minus, x, y)) candidate = &btnVal2Minus;
+    else if (inBtn(btnVal2Plus, x, y)) candidate = &btnVal2Plus;
+  } else {
+    // На экране часов используем только правые кнопки +/- (btnVal2*)
+    if (inBtn(btnVal2Minus, x, y)) candidate = &btnVal2Minus;
+    else if (inBtn(btnVal2Plus, x, y)) candidate = &btnVal2Plus;
+  }
+
+  if (!candidate) {
+    gHeldPlusMinus = nullptr;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Начали удерживать новую кнопку
+  if (gHeldPlusMinus != candidate) {
+    gHeldPlusMinus = candidate;
+    gHoldStartMs = now;
+    gHoldLastStepMs = now;
+    return;
+  }
+
+  // Уже держим эту кнопку — проверяем, не пора ли делать следующий шаг
+  unsigned long heldMs = SAFE_MILLIS_DIFF(gHoldStartMs, now);
+  unsigned long needInterval = autoRepeatIntervalMs(heldMs);
+
+  if (SAFE_MILLIS_DIFF(gHoldLastStepMs, now) >= needInterval) {
+    if (autoRepeatStep(gHeldPlusMinus)) {
+      gHoldLastStepMs = now;
+      lastTouchTime = now;    // не даём подсветке тухнуть во время кручения
+      uiNeedsUpdate = false;  // панели значений перерисовываем локально
+      forceRedraw = false;
+    } else {
+      // Нечего больше крутить (например, вышли за диапазон) — останавливаем
+      gHeldPlusMinus = nullptr;
+    }
+  }
+}
+
+
+
+uint16_t calculateCRC(const byte* data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc = _crc16_update(crc, data[i]);
+  }
+  return crc;
+}
+
+
+
+// === ДОБАВИТЬ НОВОЕ: экран СТИРАНИЕ EEPROM ===
+void drawEepromWipeScreen(bool fullRedraw) {
+  if (fullRedraw) {
+    // Сброс состояний кнопок
+    for (int i = 0; i < NUM_BUTTON_STATES; i++) {
+      buttonStates[i].pressed = false;
+      buttonStates[i].pressTime = 0;
+    }
+
+    // Заголовок и статус-бар
+    drawSettingsHeader(S_EEPROM_WIPE, false);
+
+    // Кнопки: MODE = "СТИРАНИЕ EEPROM", BACK — как унифицировано
+    drawButtonP(btnMode, S_EEPROM_WIPE_BTN, C565(255, 0, 0), 0xFFFF, true, false);
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, false);
+    delay(SCREEN_DELAY_MS);
+
+    // Очистим центр, где будут проценты
+    uint16_t bg = C565(70, 82, 95);
+    tft.fillRect(40, 120, tft.width() - 80, 80, bg);
+    // Подписи/инструкции можно не выводить — по ТЗ достаточно процентов
+  }
+  updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+}
+
+void handleEepromWipeTouch(int x, int y) {
+
+  if (currentScreen != SCREEN_EEPROM_WIPE) return;
+
+  lastTouchTime = millis();
+  static unsigned long lastActionTime = 0;
+  unsigned long now = millis();
+  if (SAFE_MILLIS_DIFF(lastActionTime, now) < TOUCH_DEBOUNCE_MS) return;
+  lastActionTime = now;
+
+  // НАЗАД
+  if (inBtn(btnBack, x, y)) {
+    beepClick();
+    drawButtonP(btnBack, S_BACK, C565(0, 80, 0), 0xFFFF, true, true);
+    delay(SCREEN_DELAY_MS);
+    currentScreen = SCREEN_SYSTEM;
+    drawSystemScreen(true);
+    return;
+  }
+
+  // РЕЖИМ — запуск стирания EEPROM с прогрессом
+  if (inBtn(btnMode, x, y)) {
+    beepClick();
+    drawButtonP(btnMode, S_EEPROM_WIPE_BTN, C565(255, 0, 0), 0xFFFF, true, true);
+    delay(80);
+
+    performEepromEraseWithProgress();
+
+    // Вернуть кнопку в обычное состояние
+    drawButtonP(btnMode, S_EEPROM_WIPE_BTN, C565(255, 0, 0), 0xFFFF, true, false);
+  }
+}
+
+void performEepromEraseWithProgress() {
+  // Площадка под проценты по центру
+  uint16_t bg = C565(70, 82, 95);
+  int areaX = 40, areaY = 120, areaW = tft.width() - 80, areaH = 80;
+  tft.fillRect(areaX, areaY, areaW, areaH, bg);
+
+  // Шрифт и выравнивание для процентов
+  tft.setFreeFont(&FreeSansBold18pt7b);
+  tft.setTextDatum(MC_DATUM);
+  // ВАЖНО: НЕ ставим setTextSize(2) глобально здесь!
+
+  const int cx = tft.width() / 2;
+  const int cy = areaY + areaH / 2;
+
+  // Подготовим область, которую будем очищать перед перерисовкой процентов.
+  // Берём размер для "100%" в выбранном масштабе, чтобы покрыть все варианты.
+  tft.setTextSize(2);
+  int pctMaxW = tft.textWidth("100%");
+  int pctH = tft.fontHeight();
+  int pctX = cx - pctMaxW / 2;
+  int pctY = cy - pctH / 2;
+  // Вернём обычный размер (будем временно ставить 2 при рисовании)
+  tft.setTextSize(1);
+
+  const int len = EEPROM.length();
+  int shownPercent = -1;
+
+  for (int i = 0; i < len; i++) {
+    byte cur = EEPROM.read(i);
+    if (cur != 0xFF) EEPROM.update(i, 0xFF);
+
+    int p = (int)((long)(i + 1) * 100L / len);
+    if (p != shownPercent) {
+      // Очищаем только прямоугольник под процентом (минимально возможная область),
+      // не трогаем всю площадку — это устраняет мерцание.
+      tft.fillRect(pctX, pctY, pctMaxW, pctH, bg);
+
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d%%", p);
+
+      // Рисуем процент только зелёным цветом (без "теневого" доприсовывания черным).
+      tft.setTextSize(2);
+      tft.setTextColor(C565(0, 255, 0));
+      tft.drawString(buf, cx, cy);
+      tft.setTextSize(1);
+
+      shownPercent = p;
+    }
+
+    // Периодически обновляем статус-бар нормальным масштабом
+    if ((i & 0x3F) == 0) {
+      wdt_reset();
+      updateStatusBar(rtcOk ? rtc.now() : DateTime(0UL));
+    }
+  }
+  // После цикла стирания:
+  initDefaultSettings(settings);
+  saveSettings();  // запишет основную и backup копию с CRC
+  initDefaultProgram(program);
+  saveProgram();  // запишет программу с CRC
+  setCurrentProgramName("—");
+  uiNeedsUpdate = true;
+  forceRedraw = true;
+
+
+  // Финал: сообщение "ПАМЯТЬ ОЧИЩЕНА"
+  tft.fillRect(areaX, areaY, areaW, areaH, bg);
+  tft.loadFont(RotondaBold20);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TCache.alertColor, bg);
+  strcpy_P(g_char_buffer, S_EEPROM_CLEARED);
+  tft.drawString(g_char_buffer, cx, cy);
+  tft.setTextDatum(TL_DATUM);
+  tft.unloadFont();
+
+  // Сброс параметров текста к дефолту
+  tft.setTextFont(0);
+  tft.setTextSize(1);
+  tft.setFreeFont(NULL);
+
+  // По желанию: принудительно перерисовать статус-бар обычным шрифтом
+  // drawStatusBar(true, rtcOk ? rtc.now() : DateTime(0UL));
+
+  logEvent(F("EEPROM очищена целиком"));
+}
+
+
+
+// Используется на экранах рецептов: Хамон/Сальчичон/Фуэт/Коппа (если нужно).
+static void drawRecipeAggregatedTable(const GroupDefRAM* groups, size_t groupCount, const CuringProgram& srcProg) {
+  // Геометрия — как в твоём примере
+  const int tableX = 10;
+  const int tableY = SETTINGS_MODE_Y + SETTINGS_MODE_H + 20;
+  const int tableW = tft.width() - 20;
+  const int tableH = 140;
+
+  tft.loadFont(RotondaBold20);
+
+  // Подберём ширину первого столбца по максимальной ширине имени группы
+  int stageColWidth = 0;
+  for (size_t i = 0; i < groupCount; i++) {
+    int w = tft.textWidth(groups[i].name);
+    if (w > stageColWidth) stageColWidth = w;
+  }
+  stageColWidth += 12;  // небольшой отступ
+
+  // Ширина "ДЛИТ" — по заголовку
+  strcpy_P(g_char_buffer, S_COL_DURATION);
+  int durationColWidth = tft.textWidth(g_char_buffer) + 14;
+
+  // Остаток делим на 2 для TEMP и RH
+  int otherColWidth = (tableW - stageColWidth - durationColWidth) / 2;
+  if (otherColWidth < 40) otherColWidth = 40;  // страховка
+  int colWidths[4] = { stageColWidth, durationColWidth, otherColWidth, otherColWidth };
+
+  // Рамка
+  uint16_t lineColor = TFT_WHITE;
+  tft.drawRect(tableX, tableY, tableW, tableH, lineColor);
+
+  // Горизонтальные линии (заголовок + groupCount строк)
+  const int rows = 1 + (int)groupCount;
+  for (int r = 1; r < rows; r++) {
+    int y = tableY + r * (tableH / rows);
+    tft.drawLine(tableX, y, tableX + tableW, y, lineColor);
+  }
+
+  // Вертикальные линии (4 столбца)
+  int colX = tableX;
+  for (int c = 1; c < 4; c++) {
+    colX += colWidths[c - 1];
+    tft.drawLine(colX, tableY, colX, tableY + tableH, lineColor);
+  }
+
+  // Заголовки
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  // ЭТАП
+  strcpy_P(g_char_buffer, S_COL_STAGE);
+  tft.drawString(g_char_buffer,
+                 tableX + colWidths[0] / 2 - tft.textWidth(g_char_buffer) / 2,
+                 tableY + 5);
+
+  // ДЛИТ
+  strcpy_P(g_char_buffer, S_COL_DURATION);
+  tft.drawString(g_char_buffer,
+                 tableX + colWidths[0] + colWidths[1] / 2 - tft.textWidth(g_char_buffer) / 2,
+                 tableY + 5);
+
+  // ТЕМП
+  strcpy_P(g_char_buffer, S_COL_TEMP);
+  tft.drawString(g_char_buffer,
+                 tableX + colWidths[0] + colWidths[1] + colWidths[2] / 2 - tft.textWidth(g_char_buffer) / 2,
+                 tableY + 5);
+
+  // ВЛАЖ
+  strcpy_P(g_char_buffer, S_COL_RH);
+  tft.drawString(g_char_buffer,
+                 tableX + colWidths[0] + colWidths[1] + colWidths[2] + colWidths[3] / 2 - tft.textWidth(g_char_buffer) / 2,
+                 tableY + 5);
+
+  // Вспомогательные буферы для отрисовки значений
+  char buf[32];
+
+  // Строки данных по группам
+  for (size_t i = 0; i < groupCount; i++) {
+    const uint8_t s0 = groups[i].start;
+    const uint8_t s1 = groups[i].end;
+
+    // Суммарная длительность в часах и диапазоны temp/hum
+    uint32_t totalHours = 0;
+    float tmin = 1000.f, tmax = -1000.f;
+    float hmin = 1000.f, hmax = -1000.f;
+
+    for (uint8_t s = s0; s <= s1 && s < srcProg.stageCount; s++) {
+      const Stage& st = srcProg.stages[s];
+      totalHours += st.durationHours;
+      if (st.targetTemp < tmin) tmin = st.targetTemp;
+      if (st.targetTemp > tmax) tmax = st.targetTemp;
+      if (st.targetHum < hmin) hmin = st.targetHum;
+      if (st.targetHum > hmax) hmax = st.targetHum;
+    }
+
+    // Формат длительности: если кратно 24 — дни, иначе часы
+    char durStr[24];
+    if (totalHours % 24 == 0) {
+      uint32_t d = totalHours / 24;
+      snprintf(durStr, sizeof(durStr), "%lu д", (unsigned long)d);
+    } else {
+      snprintf(durStr, sizeof(durStr), "%lu ч", (unsigned long)totalHours);
+    }
+
+    // Формат температур: одно значение или диапазон (1 знак после запятой)
+    char tempStr[24];
+    if (fabsf(tmax - tmin) < 0.11f) {
+      dtostrf(tmin, 0, 1, tempStr);  // одно значение
+    } else {
+      char t1[12], t2[12];
+      dtostrf(tmin, 0, 1, t1);
+      dtostrf(tmax, 0, 1, t2);
+      snprintf(tempStr, sizeof(tempStr), "%s-%s", t1, t2);
+    }
+
+    // Формат влажности: целые значения или диапазон
+    char rhStr[24];
+    if (fabsf(hmax - hmin) < 0.51f) {
+      snprintf(rhStr, sizeof(rhStr), "%d", (int)roundf(hmin));
+    } else {
+      snprintf(rhStr, sizeof(rhStr), "%d-%d", (int)roundf(hmin), (int)roundf(hmax));
+    }
+
+    // Координата строки
+    int rowY = tableY + (i + 1) * (tableH / rows) + 5;
+
+    // ЭТАП — по левому краю столбца
+    tft.drawString(groups[i].name, tableX + 5, rowY);
+
+    // ДЛИТЕЛЬНОСТЬ — центр столбца
+    tft.drawString(durStr,
+                   tableX + colWidths[0] + colWidths[1] / 2 - tft.textWidth(durStr) / 2,
+                   rowY);
+
+    // ТЕМП — центр
+    tft.drawString(tempStr,
+                   tableX + colWidths[0] + colWidths[1] + colWidths[2] / 2 - tft.textWidth(tempStr) / 2,
+                   rowY);
+
+    // ВЛАЖ — центр
+    tft.drawString(rhStr,
+                   tableX + colWidths[0] + colWidths[1] + colWidths[2] + colWidths[3] / 2 - tft.textWidth(rhStr) / 2,
+                   rowY);
+  }
+
+  tft.unloadFont();
+}
+
+// ======== ПРИЁМ КОМАНД ОТ ESP: UART STX/ETX парсер + построчные статусы ========
+// ЗАМЕНА: прием UART с накоплением в статический буфер
+void processEspUart() {
+  while (ESP_BRIDGE_SERIAL.available() > 0) {
+    const uint8_t c = (uint8_t)ESP_BRIDGE_SERIAL.read();
+
+    if (espRxInFrame) {
+      if (c == ETX) {
+        // Конец кадра — обработка JSON
+        if (espRxLen > 0) {
+          espRxBuf[espRxLen] = '\0';        // завершить C-строку
+          processEspJsonCommand(espRxBuf);  // разбор без временного String
+        }
+        espRxLen = 0;
+        espRxInFrame = false;
+        continue;
+      }
+      if (c == STX) {
+        // Новый STX внутри кадра — начать заново
+        espRxLen = 0;
+        continue;
+      }
+      // Наращиваем буфер, следим за переполнением
+      if (espRxLen < sizeof(espRxBuf) - 1) {
+        espRxBuf[espRxLen++] = (char)c;
+      } else {
+        // Переполнение — сброс кадра и выход из режима
+        espRxLen = 0;
+        espRxInFrame = false;
+      }
+      continue;
+    }
+
+    // Вне кадра — ждём начало кадра STX
+    if (c == STX) {
+      espRxInFrame = true;
+      espRxLen = 0;
+      continue;
+    }
+
+    // ETX вне кадра игнорируем
+    if (c == ETX) {
+      continue;
+    }
+  }
+}
+
+// === NEW: защита на старте/после ребута — если активна программа без UNIX-времени, отключаем ===
+
+// === NEW: на старте НЕ выключаем активную программу из-за отсутствия UNIX.
+// Ставим на паузу и ждём времени. Уставки остаются как есть. ===
+static void validateProgramOnBoot() {
+  if (!program.active) return;
+
+  if (program.startUnixTime == 0 || !rtcOk) {
+    programPausedByTimeLoss = true;
+    programPauseMs = millis();
+    programPauseUnix = 0;
+
+    logEvent(F("BOOT: активная программа обнаружена, но время недоступно. Программа поставлена на паузу до восстановления RTC/NTP."));
+    uiNeedsUpdate = true;
+    forceRedraw = true;
+
+    // НИЧЕГО не сбрасываем: stage/uставки/active — сохраняем.
+    // Прогресс продолжится автоматически, как только придёт время.
+    return;
+  }
+
+  // Если RTC валиден — убедимся, что время не "назад"
+  uint32_t nowU = rtc.now().unixtime();
+  if (nowU < program.startUnixTime) {
+    // Время "раньше старта": ставим паузу и ждём корректной синхронизации
+    programPausedByTimeLoss = true;
+    programPauseMs = millis();
+    programPauseUnix = nowU;
+    logEvent(F("BOOT: RTC time < program.startUnixTime. Программа на паузе до корректной синхронизации времени."));
+    uiNeedsUpdate = true;
+    forceRedraw = true;
+  }
+}
+
+
+
+
+// === REPLACE: продвижение этапов программы — по UNIX только, без millis ===
+
+// === Прогресс этапов: только по UNIX. При потере времени -> PAUSE, без сбросов ===
+void checkAndAdvanceProgramStage() {
+  if (!program.active) return;
+  if (degradedMode) return;
+
+  // Если RTC нет - ставим на паузу и не двигаем этапы
+  if (!rtcOk) {
+    pauseProgramDueToTimeLoss();
+    return;
+  }
+
+  // RTC появился/восстановился - если были на паузе, возобновим с компенсацией
+  if (programPausedByTimeLoss) {
+    resumeProgramAfterTimeRecovery();
+    // после resume можно продолжать обычную логику (уже с поправленным startUnixTime)
+  }
+
+  // Если стартового unix нет - тоже считаем это "нет времени для прогресса"
+  if (program.startUnixTime == 0) {
+    pauseProgramDueToTimeLoss();
+    return;
+  }
+
+  // Доп. sanity: если время странное - пауза
+  uint32_t nowU = rtc.now().unixtime();
+  if (nowU < UNIX_TIME_MIN_VALID) {  // < 2021-01-01
+    pauseProgramDueToTimeLoss();
+    return;
+  }
+
+  // elapsed
+  uint64_t totalElapsed = programElapsedMsUnixOnly();
+  if (totalElapsed == 0ULL) {
+    // это не ошибка, а "не можем считать"
+    pauseProgramDueToTimeLoss();
+    return;
+  }
+
+  uint64_t cumulativeDuration = 0;
+  bool stageChanged = false;
+
+  for (uint8_t i = 0; i < program.stageCount; i++) {
+    uint64_t stageDuration = (uint64_t)program.stages[i].durationHours * MILLIS_PER_HOUR;
+
+    // защита от переполнения
+    if (stageDuration > (UINT64_MAX - cumulativeDuration)) {
+      logEvent(F("КРИТИЧНО: Переполнение на этапе! Этапы не двигаем, ставим программу на паузу."));
+      pauseProgramDueToTimeLoss();
+      return;
+    }
+    cumulativeDuration += stageDuration;
+
+    // продвигаем ровно на 1 этап за тик (как и было у вас)
+    if (totalElapsed >= cumulativeDuration && program.currentStage == i) {
+      if (i + 1 < program.stageCount) {
+        program.currentStage = i + 1;
+        stageChanged = true;
+        char log_buf[64];
+        snprintf(log_buf, sizeof(log_buf), "Переход к этапу %u", (unsigned)program.currentStage);
+        logEvent(log_buf);
+      } else {
+        // завершение программы
+        program.active = false;
+        stageChanged = true;
+        logEvent(F("Программа завершена"));
+      }
+      break;
+    }
+  }
+
+  if (!stageChanged) return;
+
+  if (program.active) {
+    // применяем уставки нового этапа
+    settings.targetTemp = program.stages[program.currentStage].targetTemp;
+    settings.targetHum = program.stages[program.currentStage].targetHum;
+    settings.manualFanIntervalHours = program.stages[program.currentStage].fanInterval;
+    settings.manualFanDurationMinutes = program.stages[program.currentStage].fanDuration;
+
+    settingsDirty = true;
+    saveSettings();
+    saveProgram();
+
+    uiNeedsUpdate = true;
+    forceRedraw = true;
+
+    if (currentScreen == SCREEN_MAIN) {
+      drawMainProgressBar(true);
+      drawTotalProgressBar(true);
+    }
+  } else {
+    // завершено: оставляю ваше поведение "safe setpoints", но без привязки к времени
+    settings.targetTemp = 15.0f;
+    settings.targetHum = 50.0f;
+    settingsDirty = true;
+    saveSettings();
+    saveProgram();
+
+    uiNeedsUpdate = true;
+    forceRedraw = true;
+
+    if (currentScreen == SCREEN_MAIN) {
+      drawStaticLayout();
+    }
+  }
+}
+
+
+
+static void pauseProgramDueToTimeLoss() {
+  if (!program.active) return;
+  if (programPausedByTimeLoss) return;
+
+  programPausedByTimeLoss = true;
+  programPauseMs = millis();
+  programPauseUnix = (rtcOk ? (uint32_t)rtc.now().unixtime() : 0);
+
+  logEvent(F("ПРОГРАММА ВРЕМЕННО ЗАМЕРЛА ИЗ-ЗА ОТСУТСТВИЯ ЧАСОВ (RTC/NTP). Этапы не продвигаются."));
+
+  // UI подсветить/обновить (по желанию)
+  uiNeedsUpdate = true;
+}
+
+static void resumeProgramAfterTimeRecovery() {
+  if (!program.active) return;
+  if (!programPausedByTimeLoss) return;
+
+  // Если времени по-прежнему нет - не можем возобновлять
+  if (!rtcOk) return;
+
+  uint32_t nowU = rtc.now().unixtime();
+  if (nowU < UNIX_TIME_MIN_VALID) {  // sanity: > 2021-01-01
+    return;
+  }
+
+  // Если у программы не было startUnixTime, мы НЕ сбрасываем программу.
+  // Но без стартового времени двигать этапы невозможно. Выбираем безопасную стратегию:
+  //  - принять момент восстановления как "точку старта" (программа продолжит с текущего stage).
+  if (program.startUnixTime == 0) {
+    program.startUnixTime = nowU;
+    saveProgram();
+    programPausedByTimeLoss = false;
+    logEvent(F("RTC восстановлен. startUnixTime был пустой -> установлен текущий момент. Программа продолжена с текущего этапа."));
+    uiNeedsUpdate = true;
+    forceRedraw = true;
+    return;
+  }
+
+  // Основной сценарий: время было, но потом пропало.
+  // Чтобы "учесть простой" и НЕ перескочить этапы, мы сдвигаем startUnixTime вперед на длительность паузы.
+  //
+  // Идея: elapsed = now - startUnixTime.
+  // Если камера простояла без времени X секунд, то при восстановлении мы делаем:
+  // startUnixTime += X, чтобы elapsed остался примерно тем же, как перед пропажей часов.
+  uint32_t pausedAt = programPauseUnix;
+  if (pausedAt == 0) {
+    // Если не успели взять unix в момент потери времени, используем millis как приблизительную оценку.
+    // Это хуже, но лучше чем ничего: сдвигаем на "примерную" длительность.
+    unsigned long dtMs = SAFE_MILLIS_DIFF(programPauseMs, millis());
+    uint32_t dtSec = (uint32_t)(dtMs / 1000UL);
+    program.startUnixTime += dtSec;
+  } else {
+    // Нормальный путь: unix в момент паузы известен.
+    if (nowU > pausedAt) {
+      uint32_t pauseSec = nowU - pausedAt;
+      program.startUnixTime += pauseSec;
+    } else {
+      // Время "откатилось назад" — не сдвигаем. Просто продолжаем и логируем.
+      logEvent(F("WARNING: RTC восстановлен, но время меньше, чем было на паузе. Продолжаем без компенсации."));
+    }
+  }
+
+  programPausedByTimeLoss = false;
+  programPauseUnix = 0;
+  programPauseMs = 0;
+
+  saveProgram();
+
+  logEvent(F("RTC восстановлен. Программа автоматически продолжена (время паузы учтено)."));
+  uiNeedsUpdate = true;
+  forceRedraw = true;
+}
+
+
+void emergencyShutdown() {
+  if (currentTemp > EMERGENCY_TEMP_MAX) {
+    setHeater(false);
+    setCooler(false);
+    setHumidifier(false);
+    enterDegradedMode((const __FlashStringHelper*)S_OVERHEAT);  // "OVERHEAT!"
+    uiNeedsUpdate = true;                                       // >>> FIX #3: гарантируем перерисовку оверлея на следующем цикле
+    Serial.print(F("EMERGENCY SHUTDOWN! Temp: "));
+    Serial.println(currentTemp);
+  } else if (currentTemp < EMERGENCY_TEMP_MIN) {
+    setHeater(false);
+    setCooler(false);
+    setHumidifier(false);
+    enterDegradedMode((const __FlashStringHelper*)S_UNDERCOOL);  // "UNDERCOOL!"
+    uiNeedsUpdate = true;                                        // >>> FIX #3
+    Serial.print(F("EMERGENCY SHUTDOWN! Temp: "));
+    Serial.println(currentTemp);
+  }
+}
